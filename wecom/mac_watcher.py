@@ -183,22 +183,35 @@ class WeChatWatcher:
         except Exception:
             return []
 
-        # 聊天面板的 AXWebArea 有 desc=<客户名>；我们优先找 desc 与 expected_sender
-        # 主体部分（括号前）匹配的 WebArea，避免误读到经营大厅等浮层。
+        # 聊天面板的 AXWebArea 有 desc=<客户名>；按 expected_sender 的主体部分匹配。
+        # 支持的几种匹配：desc 完全等于 sender_core / sender_core 是 desc 子串 / 反之。
         sender_core = expected_sender.split("(")[0].strip() if expected_sender else ""
         all_webs = _deep_find_all(window, "AXWebArea", max_depth=15)
+
+        logger.debug(
+            "read_last_messages: expected=%r sender_core=%r, 共找到 %d 个 AXWebArea",
+            expected_sender, sender_core, len(all_webs),
+        )
+        for i, web in enumerate(all_webs):
+            logger.debug("  WebArea[%d] desc=%r", i,
+                         str(getattr(web, "AXDescription", "") or "")[:40])
 
         chat_area = None
         if sender_core and all_webs:
             for web in all_webs:
                 desc = str(getattr(web, "AXDescription", "") or "").strip()
-                if desc and (desc == sender_core or desc in expected_sender):
+                if not desc:
+                    continue
+                # 三种匹配：严格相等 / desc 含 sender_core / sender_core 含 desc
+                if desc == sender_core or sender_core in desc or desc in sender_core:
                     chat_area = web
+                    logger.debug("匹配到 AXWebArea desc=%r (via sender_core=%r)",
+                                 desc, sender_core)
                     break
 
-        # 回退：若未命中，使用"最底层最后一个" AXWebArea
         if chat_area is None and all_webs:
             chat_area = all_webs[-1]
+            logger.debug("未匹配到 sender WebArea，使用最后一个作为兜底")
 
         if chat_area is None:
             return []
@@ -228,6 +241,10 @@ class WeChatWatcher:
                 continue
             values.append(v)
 
+        logger.debug(
+            "read_last_messages: 聊天区原始 StaticText %d 个，过滤后 %d 个，返回最后 %d 条",
+            len(texts), len(values), min(count, len(values)),
+        )
         return values[-count:] if values else []
 
     def _find_chat_area(self, window):
@@ -515,9 +532,20 @@ class WeChatWatcher:
             read_n = min(unread_n + bot_in_window + 2, 30)
 
             all_msgs: list[str] = []
+            ax_read_succeeded = False
             if unread_n >= 2 or bot_in_window > 0:
                 all_msgs = self.read_last_messages(msg["conv_row"], read_n)
+                ax_read_succeeded = bool(all_msgs)
+                if not ax_read_succeeded:
+                    # AX 读失败时不能回退到预览：预览可能是我方刚发的"好的"之类，
+                    # 会被误判成自回环。直接跳过本轮，下轮重试。
+                    logger.warning(
+                        "[%s] unread=%d 但 AX 读聊天面板失败，本轮跳过等待下轮重试",
+                        sender, unread_n,
+                    )
+                    continue
             if not all_msgs:
+                # 仅 unread=1 且无 bot_in_window 穿插：直接用预览
                 all_msgs = [msg["text"]]
 
             # 防自回环：计数式过滤。dq 已于上面清理过期项。
@@ -535,6 +563,16 @@ class WeChatWatcher:
             # 若过滤后条数远超 unread_n（带入太多历史），截最后 unread_n 条
             if len(filtered_msgs) > unread_n * 2:
                 filtered_msgs = filtered_msgs[-unread_n:]
+
+            # 当被判为自回环时打印详情，便于排查
+            if not filtered_msgs and all_msgs:
+                my_text_set = [t for _, t in (dq or [])]
+                logger.info(
+                    "[%s] 读到 %d 条全被过滤（我方窗口内回复=%s）原文: %s",
+                    sender, len(all_msgs),
+                    my_text_set[-5:],  # 只显示最近 5 条
+                    " | ".join(m[:30] for m in all_msgs),
+                )
             if not filtered_msgs:
                 # 最新预览恰好是我方刚发的，说明对方没新消息 → 跳过
                 logger.info(

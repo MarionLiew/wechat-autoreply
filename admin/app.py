@@ -524,6 +524,91 @@ def _save_rules(data: dict) -> None:
 
 with tab_rules:
     ensure_rules_file()
+
+    # ── 规则测试器 ──────────────────────────────────────────
+    with st.expander("🧪 规则测试器（不发送，仅预览命中情况）", expanded=False):
+        st.caption(
+            "输入一条模拟客户消息，查看会命中哪条规则 / 废话库 / LLM。"
+            "正则匹配段会用高亮显示。"
+        )
+        test_input = st.text_area("模拟客户消息", height=80, key="rule_test_input")
+        if st.button("运行测试", key="rule_test_run"):
+            import re
+            _test_rules_data = _load_rules()
+            _test_rules = [
+                r for r in _test_rules_data.get("rules", [])
+                if r.get("enabled", True)
+            ]
+            _test_rules.sort(key=lambda r: r.get("priority", 99))
+
+            hit = None
+            highlighted = test_input
+            for r in _test_rules:
+                mt = r.get("match_type", "contains")
+                if mt == "exact":
+                    kw = (r.get("keyword") or "").strip()
+                    if kw and test_input.strip() == kw:
+                        hit = ("rules", r, kw)
+                        highlighted = f"<mark style='background:#fef08a'>{test_input}</mark>"
+                        break
+                elif mt == "contains":
+                    kw = (r.get("keyword") or "").strip()
+                    if kw and kw in test_input:
+                        hit = ("rules", r, kw)
+                        highlighted = test_input.replace(
+                            kw, f"<mark style='background:#fef08a'>{kw}</mark>"
+                        )
+                        break
+                elif mt == "regex":
+                    pat = r.get("pattern") or ""
+                    if not pat:
+                        continue
+                    try:
+                        m = re.search(pat, test_input)
+                    except re.error as e:
+                        st.error(f"规则 `{r.get('name')}` 正则错误：{e}")
+                        continue
+                    if m:
+                        hit = ("rules", r, m.group(0))
+                        highlighted = (
+                            test_input[:m.start()]
+                            + f"<mark style='background:#fef08a'>{m.group(0)}</mark>"
+                            + test_input[m.end():]
+                        )
+                        break
+
+            if hit:
+                _, rule_obj, matched = hit
+                st.success(
+                    f"✅ 命中规则：**{rule_obj.get('name')}** "
+                    f"(match_type={rule_obj.get('match_type')}, 匹配段=`{matched}`)"
+                )
+                st.markdown("**消息（高亮匹配段）**：", unsafe_allow_html=True)
+                st.markdown(highlighted, unsafe_allow_html=True)
+                st.markdown(f"**将回复**：`{rule_obj.get('reply')}`")
+            else:
+                from config import Settings as _S
+                _scur = _S()
+                if _scur.filler_enabled:
+                    st.info("🟡 无规则命中 → 将走**废话库**随机")
+                elif _scur.llm_enabled and _scur.effective_api_key:
+                    st.info("🔵 无规则命中 → 将走 **LLM**")
+                else:
+                    st.warning("⚪ 无规则命中 → 将静默不回复")
+
+        with st.expander("正则语法速查"):
+            st.markdown(
+                """
+- `.` 任意一个字符　`.*` 任意多个
+- `^abc` 开头　`abc$` 结尾
+- `\\d` 数字　`\\w` 字母/数字/下划线　`\\s` 空白
+- `[甲乙丙]` 字符类，任一命中　`[^...]` 取反
+- `(?:a|b)` 或分支　`a{2,5}` 重复 2~5 次
+- **示例**：`价格|报价|多少钱` 一次命中三个关键词
+                """
+            )
+
+    st.divider()
     st.subheader("回复规则配置")
 
     rules_data = _load_rules()
@@ -627,6 +712,27 @@ with tab_rules:
 # ══════════════════════════════════════════════════════════════
 
 with tab_settings:
+    # ── 守护进程控制 ──────────────────────────────────────
+    st.subheader("守护进程")
+    _running, _info = get_daemon_status()
+    c_status, c_start, c_stop = st.columns([3, 1, 1])
+    with c_status:
+        if _running:
+            st.success(f"✅ 运行中 — {_info}")
+        else:
+            st.warning(f"⏸ 未运行 — {_info}")
+    with c_start:
+        if st.button("▶ 启动", disabled=_running, key="set_start_daemon"):
+            ok, msg = start_daemon()
+            (st.success if ok else st.error)(msg)
+            st.rerun()
+    with c_stop:
+        if st.button("⏹ 停止", disabled=not _running, key="set_stop_daemon"):
+            ok, msg = stop_daemon()
+            (st.success if ok else st.error)(msg)
+            st.rerun()
+
+    st.divider()
     st.subheader("运行参数")
     st.caption("保存后需要重启守护进程才能生效。")
 
@@ -659,6 +765,11 @@ with tab_settings:
             value=int(_cur.poll_interval_seconds),
             help="守护进程多久检查一次未读消息。数字越小响应越快但 CPU 越高。",
         )
+        group_chat_reply = st.toggle(
+            "启用群聊自动回复",
+            value=_cur.group_chat_reply,
+            help="默认关闭：群名含 `、` 的会话被识别为群聊，跳过自动回复。",
+        )
 
     with col2:
         st.markdown("#### 回复策略")
@@ -677,13 +788,39 @@ with tab_settings:
             value=_cur.system_prompt,
             height=100,
         )
-        st.markdown("#### 排除名单")
-        excluded_senders = st.text_area(
-            "不自动回复的会话（逗号分隔，子串匹配）",
-            value=_cur.excluded_senders,
-            height=80,
-            help="会话名字含任一关键词就跳过。例如：经营线索,邮件提醒,刘明瑞",
+        llm_rate = st.number_input(
+            "LLM 每客户每分钟最多调用次数",
+            min_value=0, max_value=60, step=1,
+            value=int(_cur.llm_rate_limit_per_minute),
+            help="超限时改走废话库兜底；设为 0 表示不限流。",
         )
+
+        st.markdown("#### 排除名单")
+        # 从历史日志收集候选客户，方便多选
+        try:
+            from storage import message_log as _mlog
+            _mlog.init_db()
+            _hist = _mlog.get_recent_logs(limit=2000)
+            _hist_senders = sorted({lg.customer_id for lg in _hist if lg.customer_id})
+        except Exception:
+            _hist_senders = []
+
+        _current_excluded = [s.strip() for s in _cur.excluded_senders.split(",") if s.strip()]
+        # 把当前值也加入候选集合
+        _options = sorted(set(_hist_senders) | set(_current_excluded))
+        excluded_multi = st.multiselect(
+            "选择不回复的会话（从历史记录 + 当前名单中挑）",
+            options=_options,
+            default=[s for s in _current_excluded if s in _options],
+            help="从下拉框多选；若需要输入新关键词，请用下方文本框补充。",
+        )
+        excluded_extra = st.text_input(
+            "额外关键词（逗号分隔，子串匹配）",
+            value=",".join(s for s in _current_excluded if s not in _options),
+            help="例：刘,经营 — 匹配所有含『刘』或『经营』的会话",
+        )
+        _extra_list = [s.strip() for s in excluded_extra.split(",") if s.strip()]
+        excluded_senders = ",".join(excluded_multi + _extra_list)
 
     st.divider()
     if st.button("💾 保存设置", type="primary"):
@@ -700,8 +837,10 @@ with tab_settings:
                 "REPLY_DELAY_MIN_SECONDS": f"{delay_min}",
                 "REPLY_DELAY_MAX_SECONDS": f"{delay_max}",
                 "POLL_INTERVAL_SECONDS": f"{int(poll_interval)}",
+                "GROUP_CHAT_REPLY": "true" if group_chat_reply else "false",
                 "FILLER_ENABLED": "true" if filler_enabled else "false",
                 "LLM_ENABLED": "true" if llm_enabled else "false",
+                "LLM_RATE_LIMIT_PER_MINUTE": f"{int(llm_rate)}",
                 "SYSTEM_PROMPT": system_prompt,
                 "EXCLUDED_SENDERS": excluded_senders,
             })
@@ -721,15 +860,39 @@ with tab_settings:
 
 
 with tab_logs:
-    st.subheader("消息日志（最近 200 条）")
+    st.subheader("消息日志")
 
     try:
         from storage import message_log
         message_log.init_db()
-        logs = message_log.get_recent_logs(limit=200)
 
-        if not logs:
-            st.info("暂无消息记录。启动 run.py 并收到消息后将在此显示。")
+        # 筛选控件
+        fc1, fc2, fc3, fc4 = st.columns([2, 2, 2, 1])
+        with fc1:
+            q_customer = st.text_input("按客户筛选（子串）", key="log_f_customer")
+        with fc2:
+            q_source = st.multiselect(
+                "来源",
+                ["rules", "filler", "filler_ratelimited", "claude"],
+                key="log_f_source",
+            )
+        with fc3:
+            q_text = st.text_input("消息内容含", key="log_f_text")
+        with fc4:
+            q_limit = st.number_input("条数", min_value=50, max_value=2000, value=200, step=50)
+
+        logs = message_log.get_recent_logs(limit=int(q_limit))
+
+        # 应用筛选
+        filtered = [
+            lg for lg in logs
+            if (not q_customer or q_customer.lower() in (lg.customer_id or "").lower())
+            and (not q_source or lg.source in q_source)
+            and (not q_text or q_text.lower() in (lg.message or "").lower())
+        ]
+
+        if not filtered:
+            st.info(f"当前筛选条件下无记录（共扫描 {len(logs)} 条）。")
         else:
             import pandas as pd
 
@@ -754,6 +917,7 @@ with tab_logs:
             df = pd.DataFrame(
                 [
                     {
+                        "id": log.id,
                         "时间": fmt_time(log.created_at),
                         "客户": log.customer_id,
                         "消息": log.message,
@@ -762,21 +926,21 @@ with tab_logs:
                         "发送方式": getattr(log, "send_method", "") or "-",
                         "耗时": fmt_latency(getattr(log, "latency_ms", 0) or 0),
                     }
-                    for log in logs
+                    for log in filtered
                 ]
             )
             st.dataframe(df, use_container_width=True, hide_index=True)
 
             col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("总消息数", len(logs))
-            rules_count = sum(1 for lg in logs if lg.source == "rules")
-            filler_count = sum(1 for lg in logs if lg.source == "filler")
-            claude_count = sum(1 for lg in logs if lg.source == "claude")
+            col1.metric("筛选后", f"{len(filtered)}/{len(logs)}")
+            rules_count = sum(1 for lg in filtered if lg.source == "rules")
+            filler_count = sum(1 for lg in filtered if lg.source and lg.source.startswith("filler"))
+            claude_count = sum(1 for lg in filtered if lg.source == "claude")
             col2.metric("规则命中", rules_count)
             col3.metric("废话库", filler_count)
             col4.metric("LLM 兜底", claude_count)
 
-            latencies = [getattr(lg, "latency_ms", 0) or 0 for lg in logs]
+            latencies = [getattr(lg, "latency_ms", 0) or 0 for lg in filtered]
             latencies = [x for x in latencies if x > 0]
             if latencies:
                 avg_ms = sum(latencies) // len(latencies)
@@ -787,12 +951,63 @@ with tab_logs:
             # 发送方式分布
             from collections import Counter
             methods = Counter(
-                getattr(lg, "send_method", "") or "-" for lg in logs
+                getattr(lg, "send_method", "") or "-" for lg in filtered
             )
             if methods:
                 st.caption("发送方式分布：" + "  ·  ".join(
                     f"`{k}` × {v}" for k, v in methods.most_common()
                 ))
+
+            # ── 统计图表 ──────────────────────────────────────
+            with st.expander("📊 统计图表"):
+                chart_df = pd.DataFrame([
+                    {
+                        "时": fmt_time(lg.created_at)[:13],  # 精度到小时
+                        "来源": lg.source or "-",
+                        "耗时(秒)": (getattr(lg, "latency_ms", 0) or 0) / 1000,
+                    }
+                    for lg in filtered
+                ])
+                if not chart_df.empty:
+                    hourly = chart_df.groupby(["时", "来源"]).size().unstack(fill_value=0)
+                    st.caption("按小时 × 来源的消息数")
+                    st.bar_chart(hourly)
+
+                    nonzero = chart_df[chart_df["耗时(秒)"] > 0]["耗时(秒)"]
+                    if len(nonzero) > 1:
+                        st.caption("响应耗时分布（秒）")
+                        bins = pd.cut(nonzero, bins=[0, 5, 10, 20, 30, 60, 300, 99999],
+                                      labels=["<5s", "5-10s", "10-20s", "20-30s", "30-60s", "1-5m", ">5m"])
+                        st.bar_chart(bins.value_counts().sort_index())
+
+            # ── 删除选中记录 ──────────────────────────────────
+            with st.expander("🗑 删除记录"):
+                del_ids_input = st.text_input(
+                    "输入要删除的 id（逗号分隔，从上表 id 列取）",
+                    key="log_del_ids",
+                )
+                cd1, cd2 = st.columns([1, 3])
+                with cd1:
+                    if st.button("删除", key="log_del_btn"):
+                        try:
+                            ids = [int(x.strip()) for x in del_ids_input.split(",") if x.strip()]
+                        except ValueError:
+                            st.error("id 必须是数字")
+                            ids = []
+                        if ids:
+                            n = message_log.delete_by_ids(ids)
+                            st.success(f"已删除 {n} 条")
+                            st.rerun()
+                with cd2:
+                    if st.button("⚠️ 清空全部日志", key="log_clear_all", type="secondary"):
+                        if st.session_state.get("confirm_clear_all"):
+                            n = message_log.delete_all()
+                            st.success(f"已清空 {n} 条")
+                            st.session_state["confirm_clear_all"] = False
+                            st.rerun()
+                        else:
+                            st.session_state["confirm_clear_all"] = True
+                            st.warning("再点一次确认清空全部")
     except Exception as e:
         st.error(f"加载消息日志失败：{e}")
         st.info("请确认已安装依赖并正确配置 .env 文件。")

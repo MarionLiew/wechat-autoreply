@@ -73,6 +73,26 @@ def get_recent_hashes(hours: int = 24) -> set[str]:
     return set(rows)
 
 
+def delete_by_ids(ids: list[int]) -> int:
+    """按 id 列表删除日志；返回实际删除条数。"""
+    if not ids:
+        return 0
+    from sqlalchemy import delete
+    with Session() as s:
+        result = s.execute(delete(MessageLog).where(MessageLog.id.in_(ids)))
+        s.commit()
+        return result.rowcount or 0
+
+
+def delete_all() -> int:
+    """清空整个 message_logs 表；返回删除条数。"""
+    from sqlalchemy import delete
+    with Session() as s:
+        result = s.execute(delete(MessageLog))
+        s.commit()
+        return result.rowcount or 0
+
+
 def get_recent_logs(limit: int = 200) -> list[MessageLog]:
     """Return the most recent message logs (for admin UI)."""
     with Session() as s:

@@ -1,0 +1,6 @@
+# ── macOS Accessibility API（仅守护进程 run.py 需要） ────────
+# 用于通过辅助功能 API 控制企业微信界面
+atomacos>=2.0.0
+pyobjc-core>=10.0
+pyobjc-framework-Cocoa>=10.0
+pyobjc-framework-Quartz>=10.0

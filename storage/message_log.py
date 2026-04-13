@@ -16,10 +16,28 @@ class MessageLog(Base):
     reply: Mapped[str] = mapped_column(String(4096))
     source: Mapped[str] = mapped_column(String(16))  # "rules" or "claude"
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # 发送诊断：实际使用的文本写入方式（AXValue / setString / sendKeys）
+    send_method: Mapped[str] = mapped_column(String(32), default="")
+    # 从检测到未读消息到发送完成的毫秒数
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
 
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    # 轻量迁移：给老库补上新列
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql(
+            "PRAGMA table_info(message_logs)"
+        ).fetchall()}
+        if "send_method" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE message_logs ADD COLUMN send_method VARCHAR(32) DEFAULT ''"
+            )
+        if "latency_ms" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE message_logs ADD COLUMN latency_ms INTEGER DEFAULT 0"
+            )
 
 
 def save(
@@ -28,6 +46,8 @@ def save(
     message: str,
     reply: str,
     source: str,
+    send_method: str = "",
+    latency_ms: int = 0,
 ) -> None:
     with Session() as s:
         log = MessageLog(
@@ -36,6 +56,8 @@ def save(
             message=message,
             reply=reply,
             source=source,
+            send_method=send_method,
+            latency_ms=latency_ms,
         )
         s.add(log)
         s.commit()

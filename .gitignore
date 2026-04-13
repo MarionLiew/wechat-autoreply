@@ -26,3 +26,8 @@ logs/
 # IDE
 .vscode/
 .idea/
+
+# 运行时产物
+.daemon.pid
+ax_tree.txt
+.claude/

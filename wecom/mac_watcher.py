@@ -18,6 +18,7 @@ Bundle ID 查询：
 
 import hashlib
 import logging
+import random
 import time
 from typing import Optional
 
@@ -43,6 +44,9 @@ class WeChatWatcher:
         self._app = None
         # 从数据库加载近 24h 已处理的消息哈希，防止重启后重复回复
         self._processed: set[str] = message_log.get_recent_hashes(hours=24)
+        # 记录每个 sender 上一次处理的文本；若该 sender 的未读消失过一次
+        # （unread 列表中不再出现），则清除其记录，允许下次同样文本触发新回复。
+        self._last_text_by_sender: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # App / Window helpers
@@ -79,84 +83,34 @@ class WeChatWatcher:
         """
         定位会话列表容器。
 
-        TODO(selector): 用 Accessibility Inspector 确认
-        - 典型结构：AXSplitGroup > AXScrollArea（第一个，即左侧栏）> AXList/AXTable
-        - 或直接找 AXIdentifier="conversation_list" 的 AXScrollArea
-        尝试顺序：先精确 ID，再按结构猜测。
+        企业微信 Mac 版实测结构：
+            AXWindow > AXSplitGroup > AXSplitGroup > AXScrollArea > AXTable > AXRow > AXCell
+        策略：手动深度遍历 AXChildren 找第一个 AXTable（atomacos 的 findAll 递归不稳）。
         """
-        # 尝试 1：通过 Identifier 精确定位
-        for ident in ("conversation_list", "ConversationList", "sessionList"):
-            try:
-                return window.findFirst(AXRole="AXScrollArea", AXIdentifier=ident)
-            except Exception:
-                pass
-
-        # 尝试 2：取第一个 AXScrollArea（通常是左侧会话栏）
-        try:
-            areas = window.findAll(AXRole="AXScrollArea")
-            if areas:
-                return areas[0]
-        except Exception:
-            pass
-
-        # 尝试 3：AXList / AXTable 直接挂在 window 下
-        for role in ("AXList", "AXTable", "AXOutline"):
-            try:
-                return window.findFirst(AXRole=role)
-            except Exception:
-                pass
-
-        raise RuntimeError(
-            "找不到会话列表容器，请用 Accessibility Inspector 确认选择器后修改 "
-            "_find_conversation_list()。"
-        )
+        table = _deep_find_first(window, "AXTable", max_depth=10)
+        if table is not None:
+            return table
+        raise RuntimeError("找不到会话列表 AXTable，请检查企业微信窗口是否正常显示")
 
     def _get_conversation_rows(self, conv_list) -> list:
-        """返回会话列表中所有行元素。"""
-        for role in ("AXCell", "AXRow", "AXGroup"):
-            try:
-                rows = conv_list.findAll(AXRole=role)
-                if rows:
-                    return rows
-            except Exception:
-                pass
-        return []
+        """返回会话列表中所有行元素（AXRow，直接子节点）。"""
+        rows = [
+            ch for ch in _safe_children(conv_list)
+            if str(getattr(ch, "AXRole", "") or "") == "AXRow"
+        ]
+        return rows
 
     def _has_unread_badge(self, row) -> bool:
         """
         判断某个会话行是否有未读标记。
 
-        TODO(selector): 常见的未读角标实现方式：
-        1. AXValueIndicator（数字角标，AXValue 为整数）
-        2. 子 AXStaticText，其 AXValue 为纯数字字符串
-        3. 子元素的 AXDescription 含"未读"
-        4. 子元素的 AXTitle 含"未读"
-        遇到无法识别的情况，打开 DEBUG 日志可看到元素结构。
+        企业微信 Mac 版实测：未读角标是 row 下某个 AXCell 内的 AXButton，
+        其 AXTitle 为数字字符串（如 '1'、'3'）。
         """
-        try:
-            badge = row.findFirst(AXRole="AXValueIndicator")
-            val = badge.AXValue
-            if isinstance(val, (int, float)) and val > 0:
+        for btn in _deep_find_all(row, "AXButton", max_depth=5):
+            title = str(getattr(btn, "AXTitle", "") or "").strip()
+            if title.isdigit() and int(title) > 0:
                 return True
-            if isinstance(val, str) and val.isdigit() and int(val) > 0:
-                return True
-        except Exception:
-            pass
-
-        try:
-            for child in _safe_children(row):
-                # 检查数字角标文本
-                ax_val = str(getattr(child, "AXValue", "") or "")
-                if ax_val.isdigit() and int(ax_val) > 0:
-                    return True
-                # 检查描述文字
-                for attr in ("AXDescription", "AXTitle", "AXHelp"):
-                    text = str(getattr(child, attr, "") or "")
-                    if "未读" in text:
-                        return True
-        except Exception:
-            pass
-
         return False
 
     def find_unread_conversations(self) -> list:
@@ -170,7 +124,14 @@ class WeChatWatcher:
             return []
 
         unread = [r for r in rows if self._has_unread_badge(r)]
-        logger.debug("共 %d 个会话，其中 %d 个未读", len(rows), len(unread))
+        logger.info("会话列表共 %d 行，未读 %d 个", len(rows), len(unread))
+        if rows and not unread:
+            # 帮助排查：若总会话数>0 但未读=0，可能是 badge 选择器没识别到
+            try:
+                first_title = str(getattr(rows[0], "AXTitle", "") or "")[:30]
+                logger.debug("示例首行标题：%s", first_title)
+            except Exception:
+                pass
         return unread
 
     # ------------------------------------------------------------------
@@ -208,132 +169,240 @@ class WeChatWatcher:
 
     def extract_last_message(self, conv_row) -> Optional[dict]:
         """
-        点击会话行，提取最后一条消息的文本与发送方标识。
+        直接从会话行的 AXCell 中读取发送方和最新消息预览，**不点击、不抢焦点**。
 
-        返回 dict(text, sender_id, msg_hash)，失败返回 None。
+        企业微信 Mac 版实测：每个 AXRow > AXCell 内的 AXStaticText 顺序为：
+            [0] 发送方名字（如 '刘明瑞(男)-3647'）
+            [1] 最新消息预览（如 '你好回我一下'）
+            [2..] 时间、'@微信' 等附加标签
+        时间/标签过滤由 _is_message_text 完成。
+
+        返回 dict(text, sender_id, msg_hash, conv_row)，失败返回 None。
         """
-        # 获取会话标题作为 sender_id
-        sender_id = str(getattr(conv_row, "AXTitle", "") or "").strip()
-        if not sender_id:
-            sender_id = str(getattr(conv_row, "AXLabel", "") or "unknown").strip()
+        texts = _deep_find_all(conv_row, "AXStaticText", max_depth=5)
+        values = [
+            str(getattr(t, "AXValue", "") or "").strip()
+            for t in texts
+        ]
+        values = [v for v in values if v]
 
-        # 点击进入会话
-        try:
-            conv_row.Press()
-            time.sleep(0.4)  # 等待聊天区刷新
-        except Exception as exc:
-            logger.error("点击会话失败（%s）：%s", sender_id, exc)
+        if len(values) < 2:
+            logger.debug("会话行文本不足 2 条：%s", values)
             return None
 
-        try:
-            window = self._get_main_window()
-            chat_area = self._find_chat_area(window)
-        except Exception as exc:
-            logger.warning("找不到聊天区域：%s", exc)
+        sender_id = values[0]
+        # 过滤掉时间戳和 '@微信' 这类附加标签，取第一条有效消息
+        message_candidates = [
+            v for v in values[1:]
+            if _is_message_text(v) and v != "@微信"
+        ]
+        if not message_candidates:
+            logger.debug("会话 [%s] 无有效消息文本", sender_id)
             return None
 
-        # 取聊天区内所有静态文本，最后一条即最新消息
-        try:
-            # TODO(selector): 消息文本可能是 AXStaticText 或 AXTextField（只读）
-            texts = chat_area.findAll(AXRole="AXStaticText")
-            if not texts:
-                texts = chat_area.findAll(AXRole="AXTextField")
-
-            # 过滤空文本和时间戳（纯数字/冒号组成的短字符串）
-            candidate_texts = [
-                str(el.AXValue or "").strip()
-                for el in texts
-                if _is_message_text(str(el.AXValue or "").strip())
-            ]
-
-            if not candidate_texts:
-                logger.debug("会话 %s 未找到有效消息文本", sender_id)
-                return None
-
-            text = candidate_texts[-1]
-        except Exception as exc:
-            logger.error("提取消息文本失败：%s", exc)
-            return None
-
-        # 用 sender_id + text 生成稳定哈希，用于去重
-        msg_hash = hashlib.sha256(f"{sender_id}:{text}".encode()).hexdigest()
+        text = message_candidates[0]
+        # hash 含时间戳，保证同人同文本多次发送不会冲突 DB 唯一约束；
+        # 去重由 _last_text_by_sender 在内存里处理
+        ts = time.time()
+        msg_hash = hashlib.sha256(
+            f"{sender_id}:{text}:{ts:.3f}".encode()
+        ).hexdigest()
 
         logger.debug("提取消息 [%s] hash=%s: %s", sender_id, msg_hash[:12], text[:80])
-        return {"text": text, "sender_id": sender_id, "msg_hash": msg_hash}
+        return {
+            "text": text,
+            "sender_id": sender_id,
+            "msg_hash": msg_hash,
+            "conv_row": conv_row,
+        }
 
     # ------------------------------------------------------------------
     # Reply sending
     # ------------------------------------------------------------------
 
-    def send_reply(self, reply_text: str) -> bool:
+    def send_reply(self, reply_text: str, conv_row=None) -> tuple[bool, str]:
         """
         将回复文本写入输入框并发送。
 
-        TODO(selector): 用 Accessibility Inspector 找到输入框的准确选择器。
-        企业微信输入框通常是 AXTextArea 或富文本区域（AXWebArea 内部）。
+        发送前会点击目标会话行以切换到该会话；会短暂把企业微信拉到前台。
         """
         try:
+            app = self._get_app()
+            if not settings.silent_send:
+                app.activate()
+                time.sleep(0.2)
             window = self._get_main_window()
         except Exception as exc:
             logger.error("获取主窗口失败：%s", exc)
-            return False
+            return False, ""
 
-        input_box = None
+        if conv_row is not None:
+            if not _press_conv_row(conv_row):
+                logger.error("切换到目标会话失败（所有 Press 策略都不可用）")
+                return False, ""
+            time.sleep(0.3)
 
-        # 尝试通过 Identifier 精确定位
-        for ident in ("chat_input", "messageInput", "ChatInput", "inputArea"):
+        # 深度遍历找所有 AXTextArea；输入框通常是最后一个（聊天区右下）
+        text_areas = _deep_find_all(window, "AXTextArea", max_depth=12)
+        # 过滤掉带 AXValue='BOT' 或只读的（如消息列表中的 BOT 标签）
+        candidates = []
+        for ta in text_areas:
             try:
-                input_box = window.findFirst(AXRole="AXTextArea", AXIdentifier=ident)
-                break
+                val = str(getattr(ta, "AXValue", "") or "")
+                # 排除显示为 'BOT' 的标签；真正的输入框 AXValue 一般为空
+                if val.strip() == "BOT":
+                    continue
+                candidates.append(ta)
             except Exception:
-                pass
+                candidates.append(ta)
 
-        # 回退：取所有 AXTextArea，选最后一个（通常是输入框）
-        if input_box is None:
-            try:
-                areas = window.findAll(AXRole="AXTextArea")
-                if areas:
-                    input_box = areas[-1]
-            except Exception:
-                pass
+        if not candidates:
+            logger.error("找不到输入框（AXTextArea），共 %d 个候选", len(text_areas))
+            return False, ""
 
-        if input_box is None:
-            logger.error("找不到输入框，请用 Accessibility Inspector 确认选择器")
-            return False
+        input_box = candidates[-1]
+        logger.debug("选用输入框：AXValue=%r", getattr(input_box, "AXValue", ""))
 
         try:
-            input_box.Press()           # 聚焦
+            try:
+                input_box.AXFocused = True
+            except Exception:
+                pass
             time.sleep(0.1)
-            input_box.setString(reply_text)
-            time.sleep(0.1)
-            input_box.sendKeys("\r")    # 回车发送
-            logger.info("已发送回复：%s", reply_text[:60])
-            return True
+
+            # 写入文本：按顺序尝试多种 API，记录实际用的方法
+            used_method = ""
+            for name, setter in (
+                ("AXValue", lambda: setattr(input_box, "AXValue", reply_text)),
+                ("setString", lambda: input_box.setString(string=reply_text)),
+                ("sendKeys", lambda: input_box.sendKeys(reply_text)),
+            ):
+                try:
+                    setter()
+                    used_method = name
+                    break
+                except Exception as exc:
+                    logger.debug("写入方式 %s 失败：%s", name, exc)
+
+            if not used_method:
+                logger.error("无法写入输入框")
+                return False, ""
+
+            time.sleep(0.15)
+            enter_method = ""
+
+            # ① 元素级 Confirm / AXConfirm（最干净，不需要焦点）
+            for act in ("Confirm", "AXConfirm"):
+                fn = getattr(input_box, act, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        enter_method = act
+                        break
+                    except Exception as exc:
+                        logger.debug("%s 失败：%s", act, exc)
+
+            # ② 元素级 sendKeys 回车（只在非静默模式用；静默时企微不响应此事件）
+            if not enter_method and not settings.silent_send:
+                try:
+                    input_box.sendKeys("\r")
+                    enter_method = "sendKeys(\\r)"
+                except Exception as exc:
+                    logger.debug("元素 sendKeys 回车失败：%s", exc)
+
+            # ③ Quartz 事件：优先定向投递到企微 PID（真正静默），失败才临时激活
+            if not enter_method:
+                import Quartz
+                pid = _get_wecom_pid(settings.wecom_bundle_id)
+
+                if settings.silent_send and pid:
+                    # 定向投递：不需要激活窗口
+                    try:
+                        for down in (True, False):
+                            ev = Quartz.CGEventCreateKeyboardEvent(None, 36, down)
+                            Quartz.CGEventPostToPid(pid, ev)
+                        enter_method = f"Quartz→pid{pid}"
+                    except Exception as exc:
+                        logger.debug("CGEventPostToPid 失败：%s", exc)
+
+                # 兜底：临时激活 + HIDEventTap + 还原焦点
+                if not enter_method:
+                    prev_app = None
+                    try:
+                        from AppKit import NSWorkspace
+                        prev_app = NSWorkspace.sharedWorkspace().frontmostApplication()
+                    except Exception:
+                        pass
+                    try:
+                        self._get_app().activate()
+                        time.sleep(0.15)
+                        for down in (True, False):
+                            ev = Quartz.CGEventCreateKeyboardEvent(None, 36, down)
+                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+                        enter_method = "Quartz(activate)"
+                        time.sleep(0.1)
+                        if settings.silent_send and prev_app is not None:
+                            try:
+                                prev_app.activateWithOptions_(0)
+                            except Exception:
+                                pass
+                    except Exception as exc:
+                        logger.error("Quartz 回车也失败：%s", exc)
+                        return False, ""
+
+            method_label = f"{used_method}+{enter_method}"
+            logger.info("已发送回复（方式=%s）：%s", method_label, reply_text[:60])
+            return True, method_label
         except Exception as exc:
             logger.error("发送回复失败：%s", exc)
-            return False
+            return False, ""
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     def tick(self) -> None:
-        """单次轮询：检查未读 → 提取 → 回复 → 记录。"""
+        """单次轮询：检查未读 → 提取 → 回复 → 记录。
+
+        注意：不在轮询阶段抢占前台，避免每 5 秒把企业微信拉到最前。
+        只有在需要发送回复时，send_reply() 内部会短暂激活窗口。
+        """
         try:
-            app = self._get_app()
-            app.activate()  # 确保窗口在前台，AX 操作更可靠
+            self._get_app()  # 仅获取引用，不 activate
         except Exception as exc:
-            logger.warning("无法激活企业微信：%s", exc)
-            self._app = None  # 下次重新获取引用
+            logger.warning("无法获取企业微信 App 引用：%s", exc)
+            self._app = None
             return
 
-        for conv in self.find_unread_conversations():
+        unread = self.find_unread_conversations()
+        logger.info("本轮检测到 %d 个未读会话", len(unread))
+
+        # 预读所有未读会话的 sender，用于清理"已读过一次"的去重状态
+        current_unread_senders: set[str] = set()
+
+        parsed: list[dict] = []
+        for conv in unread:
             msg = self.extract_last_message(conv)
             if msg is None:
                 continue
+            current_unread_senders.add(msg["sender_id"])
+            parsed.append(msg)
 
-            if msg["msg_hash"] in self._processed:
-                logger.debug("已处理过，跳过：%s", msg["msg_hash"][:12])
+        # 若某 sender 之前记过但现在已不在未读列表里，说明被读过了，清掉记录
+        for sender in list(self._last_text_by_sender.keys()):
+            if sender not in current_unread_senders:
+                self._last_text_by_sender.pop(sender, None)
+
+        for msg in parsed:
+            # 同一 sender 在"未读未清除"状态下反复处理的同一条预览 → 跳过
+            if self._last_text_by_sender.get(msg["sender_id"]) == msg["text"]:
+                logger.debug("同会话重复预览，跳过：%s", msg["sender_id"])
+                continue
+
+            # 排除名单：系统账号、运营号等不参与自动回复
+            if settings.is_sender_excluded(msg["sender_id"]):
+                logger.info("排除名单命中，跳过 [%s]", msg["sender_id"])
+                self._last_text_by_sender[msg["sender_id"]] = msg["text"]
                 continue
 
             logger.info(
@@ -344,21 +413,42 @@ class WeChatWatcher:
 
             result = engine.process_message(msg["text"])
 
+            if result["source"] == "none":
+                logger.info("无匹配规则/废话库/LLM，跳过回复 [%s]: %s",
+                            msg["sender_id"], msg["text"][:60])
+                # 仅用 hash 标记当前这条消息已处理过，不整体屏蔽 sender
+                self._processed.add(msg["msg_hash"])
+                continue
+
             logger.info(
                 "回复 [来源=%s]: %s",
                 result["source"],
                 result["content"][:80],
             )
 
-            sent = self.send_reply(result["content"])
+            delay = random.uniform(
+                settings.reply_delay_min_seconds,
+                settings.reply_delay_max_seconds,
+            )
+            logger.debug("随机延迟 %.1f 秒后回复", delay)
+            time.sleep(delay)
+
+            t_start = time.monotonic()
+            sent, used_method = self.send_reply(
+                result["content"], conv_row=msg.get("conv_row")
+            )
+            latency_ms = int((time.monotonic() - t_start) * 1000)
             if sent:
                 self._processed.add(msg["msg_hash"])
+                self._last_text_by_sender[msg["sender_id"]] = msg["text"]
                 message_log.save(
                     msg_hash=msg["msg_hash"],
                     customer_id=msg["sender_id"],
                     message=msg["text"],
                     reply=result["content"],
                     source=result["source"],
+                    send_method=used_method,
+                    latency_ms=latency_ms,
                 )
 
     def run(self) -> None:
@@ -386,6 +476,98 @@ def _safe_children(element) -> list:
         return element.AXChildren or []
     except Exception:
         return []
+
+
+def _deep_find_first(root, role: str, max_depth: int = 10):
+    """深度优先遍历，返回第一个 AXRole == role 的节点；找不到返回 None。"""
+    if max_depth < 0:
+        return None
+    try:
+        if str(getattr(root, "AXRole", "") or "") == role:
+            return root
+    except Exception:
+        pass
+    for child in _safe_children(root):
+        found = _deep_find_first(child, role, max_depth - 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _get_wecom_pid(bundle_id: str) -> int | None:
+    """通过 bundle_id 查找企业微信进程 pid，用于定向投递键盘事件。"""
+    try:
+        from AppKit import NSWorkspace
+        for app in NSWorkspace.sharedWorkspace().runningApplications():
+            if app.bundleIdentifier() == bundle_id:
+                return int(app.processIdentifier())
+    except Exception:
+        pass
+    return None
+
+
+def _press_conv_row(row) -> bool:
+    """
+    点击会话行以切换到该会话。
+    尝试顺序：row.Press() → row 下首个 AXCell.Press() → setSelected → 鼠标点击坐标。
+    """
+    # 1. AXRow 自己（多数情况下不行）
+    for target in (row, _deep_find_first(row, "AXCell", max_depth=2)):
+        if target is None:
+            continue
+        for action in ("Press", "AXPress"):
+            fn = getattr(target, action, None)
+            if callable(fn):
+                try:
+                    fn()
+                    logger.debug("通过 %s.%s 切换会话成功", target.AXRole, action)
+                    return True
+                except Exception as exc:
+                    logger.debug("%s.%s 失败：%s", target.AXRole, action, exc)
+
+    # 2. 尝试设置 selected 属性
+    try:
+        row.AXSelected = True
+        logger.debug("通过 AXSelected=True 切换会话成功")
+        return True
+    except Exception as exc:
+        logger.debug("AXSelected 赋值失败：%s", exc)
+
+    # 3. 鼠标点击行中心坐标
+    try:
+        pos = row.AXPosition
+        size = row.AXSize
+        cx = pos.x + size.width / 2
+        cy = pos.y + size.height / 2
+        from atomacos import _a11y  # noqa
+        import Quartz
+        event_down = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown,
+                                                   (cx, cy), Quartz.kCGMouseButtonLeft)
+        event_up = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp,
+                                                 (cx, cy), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
+        logger.debug("通过鼠标点击 (%.0f,%.0f) 切换会话", cx, cy)
+        return True
+    except Exception as exc:
+        logger.debug("鼠标点击失败：%s", exc)
+
+    return False
+
+
+def _deep_find_all(root, role: str, max_depth: int = 10) -> list:
+    """深度优先遍历，返回所有 AXRole == role 的节点。"""
+    out: list = []
+    if max_depth < 0:
+        return out
+    try:
+        if str(getattr(root, "AXRole", "") or "") == role:
+            out.append(root)
+    except Exception:
+        pass
+    for child in _safe_children(root):
+        out.extend(_deep_find_all(child, role, max_depth - 1))
+    return out
 
 
 def _is_message_text(text: str) -> bool:

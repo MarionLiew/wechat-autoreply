@@ -38,18 +38,17 @@ def process_message(
     text: str,
     sender_id: str | None = None,
     context: list[str] | None = None,
+    history: list[dict] | None = None,
 ) -> dict:
     """
-    返回 dict，包含：
-      source: "rules" | "filler" | "claude" | "none"
-      content: 回复文本（source="none" 时为空字符串）
+    text: 当前轮合并后的客户消息文本（已过滤我方回声）
+    context: 本轮客户的各条消息（list[str]），用于 LLM 参考
+    history: 历史对话（list[{"role": "user"|"assistant", "content": "..."}]）
     """
-    # 层 1：关键词规则
     reply = rules.match(text)
     if reply is not None:
         return {"source": "rules", "content": reply}
 
-    # 层 2：废话库（按 sender 去重）
     if settings.filler_enabled:
         filler = fillers.pick_filler(
             sender_id=sender_id,
@@ -58,14 +57,13 @@ def process_message(
         if filler is not None:
             return {"source": "filler", "content": filler}
 
-    # 层 3：大模型（按 sender 限流，超限改走 filler 兜底）
     if sender_id and not _llm_allowed(sender_id):
         filler = fillers.pick_filler(sender_id=sender_id)
         if filler is not None:
             return {"source": "filler_ratelimited", "content": filler}
         return {"source": "none", "content": ""}
 
-    reply = claude_client.generate(text, context=context)
+    reply = claude_client.generate(text, context=context, history=history)
     if reply is not None:
         return {"source": "claude", "content": reply}
 

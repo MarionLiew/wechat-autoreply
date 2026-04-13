@@ -57,11 +57,18 @@ def reset_client() -> None:
     _client = None
 
 
-def generate(message: str, context: list[str] | None = None) -> str | None:
+def generate(
+    message: str,
+    context: list[str] | None = None,
+    history: list[dict] | None = None,
+) -> str | None:
     """
     调用大模型生成回复。
 
-    context：该客户最近几条历史消息（从旧到新），用于多轮上下文。
+    message: 当前轮客户消息（可能是多条合并的字符串）
+    context: 本轮客户的逐条消息列表，用于 LLM 在单 user 消息里看清分隔
+    history: 此客户的历史对话 list[{"role":"user"|"assistant","content":"..."}]
+             — 按时间升序排列，不含本轮 message
     """
     if not settings.llm_enabled:
         return None
@@ -73,18 +80,26 @@ def generate(message: str, context: list[str] | None = None) -> str | None:
         model = settings.effective_model
         client = _get_client()
 
-        # 把历史消息拼进 user 内容（简化处理：不区分 user/assistant 角色）
-        if context:
-            history = "\n".join(f"- {c}" for c in context if c and c != message)
-            if history:
-                message = f"[历史消息]\n{history}\n\n[当前消息]\n{message}"
+        # 若 context 比 message 更细致，用分条形式替换 message
+        if context and len(context) > 1:
+            message = "\n".join(f"- {c}" for c in context)
+
+        # 构造 messages 数组（历史 + 当前）
+        msgs_array: list[dict] = []
+        if history:
+            for h in history:
+                role = h.get("role")
+                content = h.get("content") or ""
+                if role in ("user", "assistant") and content:
+                    msgs_array.append({"role": role, "content": content})
+        msgs_array.append({"role": "user", "content": message})
 
         if provider == "anthropic":
             response = client.messages.create(
                 model=model,
                 max_tokens=1024,
                 system=settings.system_prompt,
-                messages=[{"role": "user", "content": message}],
+                messages=msgs_array,
             )
             return response.content[0].text
         else:
@@ -93,7 +108,7 @@ def generate(message: str, context: list[str] | None = None) -> str | None:
                 max_tokens=1024,
                 messages=[
                     {"role": "system", "content": settings.system_prompt},
-                    {"role": "user", "content": message},
+                    *msgs_array,
                 ],
             )
             return response.choices[0].message.content

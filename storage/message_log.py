@@ -93,6 +93,21 @@ def delete_all() -> int:
         return result.rowcount or 0
 
 
+def get_by_sender(sender: str, limit: int = 5) -> list[MessageLog]:
+    """按客户 id 获取最近的对话记录（按时间降序），用于 LLM 上下文。"""
+    if not sender:
+        return []
+    with Session() as s:
+        rows = s.execute(
+            select(MessageLog)
+            .where(MessageLog.customer_id == sender)
+            .order_by(MessageLog.created_at.desc())
+            .limit(limit)
+        ).scalars().all()
+        s.expunge_all()
+        return list(reversed(rows))  # 返回时按时间升序
+
+
 def get_recent_logs(limit: int = 200) -> list[MessageLog]:
     """Return the most recent message logs (for admin UI)."""
     with Session() as s:

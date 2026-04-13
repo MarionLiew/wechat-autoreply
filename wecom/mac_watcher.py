@@ -149,21 +149,29 @@ class WeChatWatcher:
     def read_last_messages(self, conv_row, count: int) -> list[str]:
         """
         点击会话（静默），从右侧聊天面板读最近 count 条消息文本。
-
-        失败返回空列表；调用方应回退到预览（extract_last_message）。
+        最多重试 3 次，每次间隔 0.3 秒。失败返回 []。
         """
         if count <= 0:
             return []
+
+        for attempt in range(3):
+            result = self._try_read_last_messages(conv_row, count)
+            if result:
+                return result
+            if attempt < 2:
+                time.sleep(0.3)
+        return []
+
+    def _try_read_last_messages(self, conv_row, count: int) -> list[str]:
         if not _press_conv_row(conv_row):
             return []
-        time.sleep(0.35)  # 等聊天区刷新
+        time.sleep(0.35)
 
         try:
             window = self._get_main_window()
         except Exception:
             return []
 
-        # 聊天区通常是最后一个 AXScrollArea 下的 AXWebArea
         scroll_areas = _deep_find_all(window, "AXScrollArea", max_depth=12)
         chat_area = None
         for sa in reversed(scroll_areas):
@@ -465,37 +473,37 @@ class WeChatWatcher:
                 self._last_text_by_sender[sender] = msg["text"]
                 continue
 
-            # 读取该会话所有未读消息作为完整上下文
+            # 读取条数：unread_n + 窗口内我方回复数 + 2 缓冲，上限 30
             unread_n = max(1, msg.get("unread_count", 1))
+            now_ts = time.time()
+            dq = self._recent_replies_by_sender.get(sender)
+            if dq:
+                while dq and now_ts - dq[0][0] > settings.echo_protect_seconds:
+                    dq.popleft()
+            bot_in_window = len(dq) if dq else 0
+            read_n = min(unread_n + bot_in_window + 2, 30)
+
             all_msgs: list[str] = []
-            if unread_n >= 2:
-                all_msgs = self.read_last_messages(msg["conv_row"], unread_n)
+            if unread_n >= 2 or bot_in_window > 0:
+                all_msgs = self.read_last_messages(msg["conv_row"], read_n)
             if not all_msgs:
                 all_msgs = [msg["text"]]
 
-            # 防自回环：**计数式**过滤。
-            # 比如我们在窗口内发过 2 条"好的"，面板读到 3 条"好的"，对方实际发了 1 条。
-            # 比如我们发过 1 条"好的"，对方马上也回"好的"，面板读到 2 条：
-            # 移除 1 条（我们的）后剩 1 条，对方的会被正常处理。
-            now = time.time()
-            dq = self._recent_replies_by_sender.get(sender)
-            if dq:
-                while dq and now - dq[0][0] > settings.echo_protect_seconds:
-                    dq.popleft()
-
-            # 统计窗口内我方各文本的发送次数
+            # 防自回环：计数式过滤。dq 已于上面清理过期项。
             from collections import Counter as _C
             my_counts = _C(text for _, text in (dq or []))
 
             filtered_msgs: list[str] = []
-            # 倒序遍历 all_msgs（最新的先），每次遇到我方发过的文本消耗一个配额；
-            # 配额用光后，后面的同文本视为对方发的，保留。
             for m in reversed(all_msgs):
                 if my_counts.get(m, 0) > 0:
                     my_counts[m] -= 1
                     continue
                 filtered_msgs.append(m)
             filtered_msgs.reverse()
+
+            # 若过滤后条数远超 unread_n（带入太多历史），截最后 unread_n 条
+            if len(filtered_msgs) > unread_n * 2:
+                filtered_msgs = filtered_msgs[-unread_n:]
             if not filtered_msgs:
                 # 最新预览恰好是我方刚发的，说明对方没新消息 → 跳过
                 logger.info(
@@ -512,11 +520,24 @@ class WeChatWatcher:
                 sender, len(all_msgs), combined_text[:120].replace("\n", " | "),
             )
 
-            # 引擎用合并文本做匹配，同时把上下文传给 LLM
+            # 构造历史对话：从 message_log 拉最近 5 条，转成 LLM 消息数组
+            history: list[dict] = []
+            try:
+                past = message_log.get_by_sender(sender, limit=5)
+                for row in past:
+                    if row.message:
+                        history.append({"role": "user", "content": row.message})
+                    if row.reply:
+                        history.append({"role": "assistant", "content": row.reply})
+            except Exception as exc:
+                logger.debug("读取历史对话失败：%s", exc)
+
+            # 引擎用合并文本做匹配；LLM 收到上下文 + 历史
             result = engine.process_message(
                 combined_text,
                 sender_id=sender,
                 context=all_msgs,
+                history=history,
             )
 
             if result["source"] == "none":
@@ -538,6 +559,15 @@ class WeChatWatcher:
             )
             logger.debug("随机延迟 %.1f 秒后回复", delay)
             time.sleep(delay)
+
+            # 打字风暴检测：delay 期间客户又发了消息 → 放弃本次回复，下轮重新合并
+            new_unread = self._unread_count(msg["conv_row"])
+            if new_unread > unread_n:
+                logger.info(
+                    "[%s] delay 期间收到 %d 条新消息，本轮跳过（下轮合并处理）",
+                    sender, new_unread - unread_n,
+                )
+                continue
 
             t_start = time.monotonic()
             sent, used_method = self.send_reply(

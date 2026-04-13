@@ -545,6 +545,7 @@ with tab_rules:
             highlighted = test_input
             for r in _test_rules:
                 mt = r.get("match_type", "contains")
+                ic = r.get("ignore_case", False)
                 if mt == "exact":
                     kw = (r.get("keyword") or "").strip()
                     if kw and test_input.strip() == kw:
@@ -553,18 +554,32 @@ with tab_rules:
                         break
                 elif mt == "contains":
                     kw = (r.get("keyword") or "").strip()
-                    if kw and kw in test_input:
+                    hit_ok = (
+                        (ic and kw.lower() in test_input.lower())
+                        or (not ic and kw and kw in test_input)
+                    )
+                    if hit_ok:
                         hit = ("rules", r, kw)
-                        highlighted = test_input.replace(
-                            kw, f"<mark style='background:#fef08a'>{kw}</mark>"
-                        )
+                        # 替换原文中的匹配段（简化处理：先按 ic 找位置）
+                        haystack = test_input
+                        needle_lo = kw.lower() if ic else kw
+                        src_lo = haystack.lower() if ic else haystack
+                        idx = src_lo.find(needle_lo)
+                        if idx >= 0:
+                            seg = haystack[idx:idx + len(kw)]
+                            highlighted = (
+                                haystack[:idx]
+                                + f"<mark style='background:#fef08a'>{seg}</mark>"
+                                + haystack[idx + len(kw):]
+                            )
                         break
                 elif mt == "regex":
                     pat = r.get("pattern") or ""
                     if not pat:
                         continue
+                    flags = re.MULTILINE | (re.IGNORECASE if ic else 0)
                     try:
-                        m = re.search(pat, test_input)
+                        m = re.search(pat, test_input, flags=flags)
                     except re.error as e:
                         st.error(f"规则 `{r.get('name')}` 正则错误：{e}")
                         continue
@@ -634,6 +649,12 @@ with tab_rules:
                         )
                 new_reply = st.text_area("回复内容", value=rule.get("reply", ""), key=f"reply_{i}")
                 new_priority = st.number_input("优先级（越小越高）", value=rule.get("priority", 99), step=1, key=f"pri_{i}")
+                new_ignore_case = st.checkbox(
+                    "忽略大小写",
+                    value=rule.get("ignore_case", False),
+                    key=f"ic_{i}",
+                    help="对 contains / regex 都生效；exact 不受影响",
+                )
             with col2:
                 new_enabled = st.checkbox("启用", value=rule.get("enabled", True), key=f"en_{i}")
                 if st.button("保存", key=f"save_{i}"):
@@ -645,6 +666,7 @@ with tab_rules:
                         reply=new_reply,
                         priority=int(new_priority),
                         enabled=new_enabled,
+                        ignore_case=bool(new_ignore_case),
                     )
                     rules_data["rules"] = rules
                     _save_rules(rules_data)
@@ -674,6 +696,7 @@ with tab_rules:
                 )
         n_reply = st.text_area("回复内容")
         n_priority = st.number_input("优先级", value=len(rules) + 1, step=1)
+        n_ignore_case = st.checkbox("忽略大小写", value=False)
         if st.form_submit_button("添加规则"):
             new_rule = {
                 "id": f"rule_{uuid.uuid4().hex[:6]}",
@@ -684,6 +707,7 @@ with tab_rules:
                 "pattern": n_kw if n_match == "regex" else None,
                 "reply": n_reply,
                 "priority": int(n_priority),
+                "ignore_case": bool(n_ignore_case),
             }
             rules.append(new_rule)
             rules_data["rules"] = rules

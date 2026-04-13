@@ -47,9 +47,10 @@ class WeChatWatcher:
         # 记录每个 sender 上一次处理的文本；若该 sender 的未读消失过一次
         # （unread 列表中不再出现），则清除其记录，允许下次同样文本触发新回复。
         self._last_text_by_sender: dict[str, str] = {}
-        # 每个 sender 最近自动发出的回复（用于识别 "自己发的消息"，防自回环）
+        # 每个 sender 最近自动发出的回复 + 时间戳，用于识别"自己发的消息"防自回环；
+        # 超过 _echo_window_seconds 的老回复会被清理，对方日后再发同样文本不会被误过滤。
         from collections import deque
-        self._recent_replies_by_sender: dict[str, deque] = {}
+        self._recent_replies_by_sender: dict[str, deque[tuple[float, str]]] = {}
 
     # ------------------------------------------------------------------
     # App / Window helpers
@@ -472,9 +473,13 @@ class WeChatWatcher:
             if not all_msgs:
                 all_msgs = [msg["text"]]
 
-            # 过滤掉"我方最近发过的消息"，防止自回环
-            # （AX 聊天面板里我方和对方都是 AXStaticText，无法从结构区分）
-            my_recent = set(self._recent_replies_by_sender.get(sender, []))
+            # 过滤掉"我方最近发过的消息"防自回环：只看最近 _echo_window_seconds 窗口内
+            now = time.time()
+            dq = self._recent_replies_by_sender.get(sender)
+            if dq:
+                while dq and now - dq[0][0] > settings.echo_protect_seconds:
+                    dq.popleft()
+            my_recent = {text for _, text in (dq or [])}
             filtered_msgs = [m for m in all_msgs if m not in my_recent]
             if not filtered_msgs:
                 # 最新预览恰好是我方刚发的，说明对方没新消息 → 跳过
@@ -530,7 +535,7 @@ class WeChatWatcher:
                 # 记录我方刚发出的回复，下一轮若 AX 读到相同文本应视为自己的消息
                 from collections import deque as _dq
                 dq = self._recent_replies_by_sender.setdefault(sender, _dq(maxlen=20))
-                dq.append(result["content"])
+                dq.append((time.time(), result["content"]))
                 message_log.save(
                     msg_hash=msg["msg_hash"],
                     customer_id=sender,

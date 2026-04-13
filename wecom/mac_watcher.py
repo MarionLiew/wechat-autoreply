@@ -81,15 +81,17 @@ class WeChatWatcher:
 
     def _find_conversation_list(self, window):
         """
-        定位会话列表容器。
-
-        企业微信 Mac 版实测结构：
-            AXWindow > AXSplitGroup > AXSplitGroup > AXScrollArea > AXTable > AXRow > AXCell
-        策略：手动深度遍历 AXChildren 找第一个 AXTable（atomacos 的 findAll 递归不稳）。
+        定位会话列表容器（企微 Mac：AXWindow > ... > AXTable）。
+        失败时自动触发 ax_tree 快照，方便企微版本升级后重新定位选择器。
         """
         table = _deep_find_first(window, "AXTable", max_depth=10)
         if table is not None:
             return table
+        try:
+            from wecom import selectors
+            selectors._maybe_dump("watcher 未找到会话列表 AXTable")
+        except Exception:
+            pass
         raise RuntimeError("找不到会话列表 AXTable，请检查企业微信窗口是否正常显示")
 
     def _get_conversation_rows(self, conv_list) -> list:

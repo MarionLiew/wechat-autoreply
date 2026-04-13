@@ -473,14 +473,29 @@ class WeChatWatcher:
             if not all_msgs:
                 all_msgs = [msg["text"]]
 
-            # 过滤掉"我方最近发过的消息"防自回环：只看最近 _echo_window_seconds 窗口内
+            # 防自回环：**计数式**过滤。
+            # 比如我们在窗口内发过 2 条"好的"，面板读到 3 条"好的"，对方实际发了 1 条。
+            # 比如我们发过 1 条"好的"，对方马上也回"好的"，面板读到 2 条：
+            # 移除 1 条（我们的）后剩 1 条，对方的会被正常处理。
             now = time.time()
             dq = self._recent_replies_by_sender.get(sender)
             if dq:
                 while dq and now - dq[0][0] > settings.echo_protect_seconds:
                     dq.popleft()
-            my_recent = {text for _, text in (dq or [])}
-            filtered_msgs = [m for m in all_msgs if m not in my_recent]
+
+            # 统计窗口内我方各文本的发送次数
+            from collections import Counter as _C
+            my_counts = _C(text for _, text in (dq or []))
+
+            filtered_msgs: list[str] = []
+            # 倒序遍历 all_msgs（最新的先），每次遇到我方发过的文本消耗一个配额；
+            # 配额用光后，后面的同文本视为对方发的，保留。
+            for m in reversed(all_msgs):
+                if my_counts.get(m, 0) > 0:
+                    my_counts[m] -= 1
+                    continue
+                filtered_msgs.append(m)
+            filtered_msgs.reverse()
             if not filtered_msgs:
                 # 最新预览恰好是我方刚发的，说明对方没新消息 → 跳过
                 logger.info(

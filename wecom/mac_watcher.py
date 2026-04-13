@@ -163,28 +163,57 @@ class WeChatWatcher:
         return []
 
     def _try_read_last_messages(self, conv_row, count: int) -> list[str]:
+        # 从会话行拿期望的 sender 名字作为定位锚点
+        expected_sender = ""
+        try:
+            for t in _deep_find_all(conv_row, "AXStaticText", max_depth=5):
+                v = str(getattr(t, "AXValue", "") or "").strip()
+                if v:
+                    expected_sender = v
+                    break
+        except Exception:
+            pass
+
         if not _press_conv_row(conv_row):
             return []
-        time.sleep(0.35)
+        time.sleep(0.6)  # 等聊天面板切换完成（原 0.35s 不够）
 
         try:
             window = self._get_main_window()
         except Exception:
             return []
 
-        scroll_areas = _deep_find_all(window, "AXScrollArea", max_depth=12)
+        # 聊天面板的 AXWebArea 有 desc=<客户名>；我们优先找 desc 与 expected_sender
+        # 主体部分（括号前）匹配的 WebArea，避免误读到经营大厅等浮层。
+        sender_core = expected_sender.split("(")[0].strip() if expected_sender else ""
+        all_webs = _deep_find_all(window, "AXWebArea", max_depth=15)
+
         chat_area = None
-        for sa in reversed(scroll_areas):
-            web = _deep_find_first(sa, "AXWebArea", max_depth=3)
-            if web is not None:
-                chat_area = web
-                break
-        if chat_area is None and scroll_areas:
-            chat_area = scroll_areas[-1]
+        if sender_core and all_webs:
+            for web in all_webs:
+                desc = str(getattr(web, "AXDescription", "") or "").strip()
+                if desc and (desc == sender_core or desc in expected_sender):
+                    chat_area = web
+                    break
+
+        # 回退：若未命中，使用"最底层最后一个" AXWebArea
+        if chat_area is None and all_webs:
+            chat_area = all_webs[-1]
+
         if chat_area is None:
             return []
 
-        # 取所有 StaticText，倒序扫描取有效文本直到凑够 count 条
+        # 已知 UI 噪声（浮层/按钮/标签），不应作为消息内容
+        UI_NOISE = {
+            "@微信", "筛选", "搜索", "共", "条", "批量处理",
+            "经营大厅", "快捷回复", "人工客服", "快速会议",
+            "展开", "收起", "发送", "取消",
+        }
+        UI_NOISE_PREFIX = (
+            "您不是该客户绑定",
+            "对方默认同意存档",
+        )
+
         texts = _deep_find_all(chat_area, "AXStaticText", max_depth=15)
         values: list[str] = []
         for t in texts:
@@ -193,7 +222,9 @@ class WeChatWatcher:
                 continue
             if not _is_message_text(v):
                 continue
-            if v in ("@微信", "筛选", "搜索", "共", "条", "批量处理"):
+            if v in UI_NOISE:
+                continue
+            if any(v.startswith(p) for p in UI_NOISE_PREFIX):
                 continue
             values.append(v)
 

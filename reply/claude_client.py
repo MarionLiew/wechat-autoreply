@@ -57,13 +57,11 @@ def reset_client() -> None:
     _client = None
 
 
-def generate(message: str) -> str | None:
+def generate(message: str, context: list[str] | None = None) -> str | None:
     """
     调用大模型生成回复。
 
-    以下情况直接返回 None（静默跳过）：
-    - llm_enabled=False
-    - effective_api_key 为空
+    context：该客户最近几条历史消息（从旧到新），用于多轮上下文。
     """
     if not settings.llm_enabled:
         return None
@@ -75,6 +73,12 @@ def generate(message: str) -> str | None:
         model = settings.effective_model
         client = _get_client()
 
+        # 把历史消息拼进 user 内容（简化处理：不区分 user/assistant 角色）
+        if context:
+            history = "\n".join(f"- {c}" for c in context if c and c != message)
+            if history:
+                message = f"[历史消息]\n{history}\n\n[当前消息]\n{message}"
+
         if provider == "anthropic":
             response = client.messages.create(
                 model=model,
@@ -84,7 +88,6 @@ def generate(message: str) -> str | None:
             )
             return response.content[0].text
         else:
-            # OpenAI 兼容接口
             response = client.chat.completions.create(
                 model=model,
                 max_tokens=1024,

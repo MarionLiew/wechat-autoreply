@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     # 静默发送：发送回复时不抢焦点；失败再回退到激活窗口
     silent_send: bool = False
 
+    # 群聊自动回复：默认关闭，避免群里被 @ 时给所有人刷屏
+    group_chat_reply: bool = False
+
+    # LLM 速率限制：同一客户每分钟最多调用 N 次，超出改走 filler 或跳过
+    llm_rate_limit_per_minute: int = 6
+
+    # 给 LLM 的上下文消息数（触发 LLM 时会尝试读最近 N 条作为上下文）
+    context_message_count: int = 3
+
+    # 废话库防重复：同一客户最近 N 次回复不会选中同一句 filler
+    filler_antirepeat_window: int = 5
+
     # ── 排除名单 ─────────────────────────────────────────────
     # 会话名字包含任一关键词（大小写不敏感）将被跳过，不回复。
     # 在 .env 里用英文逗号分隔：EXCLUDED_SENDERS=经营线索,客户联系,邮件提醒

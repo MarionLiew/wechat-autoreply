@@ -30,5 +30,23 @@ logging.basicConfig(
 )
 
 if __name__ == "__main__":
-    watcher = WeChatWatcher()
-    watcher.run()
+    import time
+    logger = logging.getLogger("run")
+
+    # 崩溃自拉起：捕获任何未处理异常后等几秒重启
+    backoff = 3
+    while True:
+        try:
+            watcher = WeChatWatcher()
+            watcher.run()
+        except KeyboardInterrupt:
+            logger.info("收到 Ctrl+C，退出")
+            break
+        except Exception as exc:
+            logger.exception("守护进程异常退出，%d 秒后重启：%s", backoff, exc)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # 指数退避，上限 60 秒
+            continue
+        # 正常退出（watcher.run 的 while 跑完）也重启，避免静默停摆
+        logger.warning("watcher.run() 正常返回，异常情况，1 秒后重启")
+        time.sleep(1)

@@ -7,8 +7,10 @@ from pathlib import Path
 
 FILLERS_FILE = Path(__file__).parent.parent / "fillers.json"
 
-# 模块级已用索引队列（进程内持久，不跨重启）
+# 全局最近使用（兜底）
 _used: deque[int] = deque()
+# 按 sender 的最近使用，避免同一客户连续看到相同 filler
+_used_by_sender: dict[str, deque[int]] = {}
 
 
 def load_fillers() -> list[str]:
@@ -26,31 +28,30 @@ def save_fillers(fillers: list[str]) -> None:
         json.dump({"fillers": fillers}, f, ensure_ascii=False, indent=2)
 
 
-def pick_filler() -> str | None:
+def pick_filler(sender_id: str | None = None, window: int = 5) -> str | None:
     """
-    从废话库随机选一条，避免与最近使用的重复。
+    从废话库随机选一条，避免重复。
 
-    算法：
-    1. 排除最近使用的 min(len//2, 3) 条索引作为候选池
-    2. 若候选池为空（库太小），直接全量随机
-    3. 从候选池中 random.choice，记录到 _used deque
+    - 传 sender_id：按该客户最近 `window` 次回复去重（同一客户看到的更多样）
+    - 不传：走全局去重
     """
     fillers = load_fillers()
     if not fillers:
         return None
 
     n = len(fillers)
-    exclude_count = min(n // 2, 3)
-    recent = set(list(_used)[-exclude_count:]) if exclude_count > 0 else set()
-    candidates = [i for i in range(n) if i not in recent]
+    if sender_id:
+        dq = _used_by_sender.setdefault(sender_id, deque())
+        exclude_count = min(n - 1, window)
+        recent = set(list(dq)[-exclude_count:]) if exclude_count > 0 else set()
+    else:
+        dq = _used
+        exclude_count = min(n // 2, 3)
+        recent = set(list(dq)[-exclude_count:]) if exclude_count > 0 else set()
 
-    if not candidates:
-        candidates = list(range(n))
-
+    candidates = [i for i in range(n) if i not in recent] or list(range(n))
     idx = random.choice(candidates)
-    _used.append(idx)
-    # 只保留最近 max(n, 10) 条记录，避免无限增长
-    while len(_used) > max(n, 10):
-        _used.popleft()
-
+    dq.append(idx)
+    while len(dq) > max(n, 10):
+        dq.popleft()
     return fillers[idx]

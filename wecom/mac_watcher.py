@@ -101,17 +101,19 @@ class WeChatWatcher:
         return rows
 
     def _has_unread_badge(self, row) -> bool:
-        """
-        判断某个会话行是否有未读标记。
+        return self._unread_count(row) > 0
 
-        企业微信 Mac 版实测：未读角标是 row 下某个 AXCell 内的 AXButton，
-        其 AXTitle 为数字字符串（如 '1'、'3'）。
+    def _unread_count(self, row) -> int:
+        """
+        返回某个会话行的未读数（AXButton title 为数字），无则返回 0。
         """
         for btn in _deep_find_all(row, "AXButton", max_depth=5):
             title = str(getattr(btn, "AXTitle", "") or "").strip()
-            if title.isdigit() and int(title) > 0:
-                return True
-        return False
+            if title.isdigit():
+                n = int(title)
+                if n > 0:
+                    return n
+        return 0
 
     def find_unread_conversations(self) -> list:
         """返回含未读消息的会话行元素列表。"""
@@ -137,6 +139,51 @@ class WeChatWatcher:
     # ------------------------------------------------------------------
     # Message extraction
     # ------------------------------------------------------------------
+
+    def read_last_messages(self, conv_row, count: int) -> list[str]:
+        """
+        点击会话（静默），从右侧聊天面板读最近 count 条消息文本。
+
+        失败返回空列表；调用方应回退到预览（extract_last_message）。
+        """
+        if count <= 0:
+            return []
+        if not _press_conv_row(conv_row):
+            return []
+        time.sleep(0.35)  # 等聊天区刷新
+
+        try:
+            window = self._get_main_window()
+        except Exception:
+            return []
+
+        # 聊天区通常是最后一个 AXScrollArea 下的 AXWebArea
+        scroll_areas = _deep_find_all(window, "AXScrollArea", max_depth=12)
+        chat_area = None
+        for sa in reversed(scroll_areas):
+            web = _deep_find_first(sa, "AXWebArea", max_depth=3)
+            if web is not None:
+                chat_area = web
+                break
+        if chat_area is None and scroll_areas:
+            chat_area = scroll_areas[-1]
+        if chat_area is None:
+            return []
+
+        # 取所有 StaticText，倒序扫描取有效文本直到凑够 count 条
+        texts = _deep_find_all(chat_area, "AXStaticText", max_depth=15)
+        values: list[str] = []
+        for t in texts:
+            v = str(getattr(t, "AXValue", "") or "").strip()
+            if not v:
+                continue
+            if not _is_message_text(v):
+                continue
+            if v in ("@微信", "筛选", "搜索", "共", "条", "批量处理"):
+                continue
+            values.append(v)
+
+        return values[-count:] if values else []
 
     def _find_chat_area(self, window):
         """
@@ -385,33 +432,53 @@ class WeChatWatcher:
             msg = self.extract_last_message(conv)
             if msg is None:
                 continue
+            msg["unread_count"] = self._unread_count(conv)
             current_unread_senders.add(msg["sender_id"])
             parsed.append(msg)
 
-        # 若某 sender 之前记过但现在已不在未读列表里，说明被读过了，清掉记录
         for sender in list(self._last_text_by_sender.keys()):
             if sender not in current_unread_senders:
                 self._last_text_by_sender.pop(sender, None)
 
         for msg in parsed:
-            # 同一 sender 在"未读未清除"状态下反复处理的同一条预览 → 跳过
-            if self._last_text_by_sender.get(msg["sender_id"]) == msg["text"]:
-                logger.debug("同会话重复预览，跳过：%s", msg["sender_id"])
+            sender = msg["sender_id"]
+
+            if self._last_text_by_sender.get(sender) == msg["text"]:
+                logger.debug("同会话重复预览，跳过：%s", sender)
                 continue
 
-            # 排除名单：系统账号、运营号等不参与自动回复
-            if settings.is_sender_excluded(msg["sender_id"]):
-                logger.info("排除名单命中，跳过 [%s]", msg["sender_id"])
-                self._last_text_by_sender[msg["sender_id"]] = msg["text"]
+            # 群聊识别：title 含 "、" 通常表示多人聚合
+            is_group = "、" in sender
+            if is_group and not settings.group_chat_reply:
+                logger.info("群聊已禁用自动回复，跳过 [%s]", sender[:40])
+                self._last_text_by_sender[sender] = msg["text"]
                 continue
 
+            if settings.is_sender_excluded(sender):
+                logger.info("排除名单命中，跳过 [%s]", sender)
+                self._last_text_by_sender[sender] = msg["text"]
+                continue
+
+            # 读取该会话所有未读消息作为完整上下文
+            unread_n = max(1, msg.get("unread_count", 1))
+            all_msgs: list[str] = []
+            if unread_n >= 2:
+                all_msgs = self.read_last_messages(msg["conv_row"], unread_n)
+            if not all_msgs:
+                all_msgs = [msg["text"]]
+
+            combined_text = "\n".join(all_msgs)
             logger.info(
-                "新消息 [%s]: %s",
-                msg["sender_id"],
-                msg["text"][:80],
+                "新消息 [%s] 共 %d 条: %s",
+                sender, len(all_msgs), combined_text[:120].replace("\n", " | "),
             )
 
-            result = engine.process_message(msg["text"])
+            # 引擎用合并文本做匹配，同时把上下文传给 LLM
+            result = engine.process_message(
+                combined_text,
+                sender_id=sender,
+                context=all_msgs,
+            )
 
             if result["source"] == "none":
                 logger.info("无匹配规则/废话库/LLM，跳过回复 [%s]: %s",
@@ -440,11 +507,11 @@ class WeChatWatcher:
             latency_ms = int((time.monotonic() - t_start) * 1000)
             if sent:
                 self._processed.add(msg["msg_hash"])
-                self._last_text_by_sender[msg["sender_id"]] = msg["text"]
+                self._last_text_by_sender[sender] = msg["text"]
                 message_log.save(
                     msg_hash=msg["msg_hash"],
-                    customer_id=msg["sender_id"],
-                    message=msg["text"],
+                    customer_id=sender,
+                    message=combined_text,
                     reply=result["content"],
                     source=result["source"],
                     send_method=used_method,

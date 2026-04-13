@@ -184,9 +184,14 @@ class WeChatWatcher:
             return []
 
         # 聊天面板的 AXWebArea 有 desc=<客户名>；按 expected_sender 的主体部分匹配。
-        # 支持的几种匹配：desc 完全等于 sender_core / sender_core 是 desc 子串 / 反之。
         sender_core = expected_sender.split("(")[0].strip() if expected_sender else ""
         all_webs = _deep_find_all(window, "AXWebArea", max_depth=15)
+
+        # 企微的功能浮层（desc 为这些的 WebArea 不是聊天内容）
+        FUNCTION_PANEL_DESCS = {
+            "经营大厅", "快捷回复", "人工客服", "快速会议",
+            "筛选", "批量处理", "搜索",
+        }
 
         logger.debug(
             "read_last_messages: expected=%r sender_core=%r, 共找到 %d 个 AXWebArea",
@@ -202,16 +207,28 @@ class WeChatWatcher:
                 desc = str(getattr(web, "AXDescription", "") or "").strip()
                 if not desc:
                     continue
-                # 三种匹配：严格相等 / desc 含 sender_core / sender_core 含 desc
+                if desc in FUNCTION_PANEL_DESCS:
+                    continue
                 if desc == sender_core or sender_core in desc or desc in sender_core:
                     chat_area = web
-                    logger.debug("匹配到 AXWebArea desc=%r (via sender_core=%r)",
-                                 desc, sender_core)
+                    logger.debug("匹配到 AXWebArea desc=%r", desc)
                     break
 
+        # 兜底：排除功能浮层后选最后一个
         if chat_area is None and all_webs:
-            chat_area = all_webs[-1]
-            logger.debug("未匹配到 sender WebArea，使用最后一个作为兜底")
+            non_panel_webs = [
+                w for w in all_webs
+                if str(getattr(w, "AXDescription", "") or "").strip()
+                not in FUNCTION_PANEL_DESCS
+            ]
+            if non_panel_webs:
+                chat_area = non_panel_webs[-1]
+                logger.debug("未精确匹配，使用非功能面板的最后 WebArea 兜底")
+            else:
+                logger.warning(
+                    "所有 AXWebArea 都是功能浮层 %s，放弃 AX 读取（回退到预览）",
+                    [str(getattr(w, "AXDescription", "") or "") for w in all_webs],
+                )
 
         if chat_area is None:
             return []
@@ -532,20 +549,15 @@ class WeChatWatcher:
             read_n = min(unread_n + bot_in_window + 2, 30)
 
             all_msgs: list[str] = []
-            ax_read_succeeded = False
             if unread_n >= 2 or bot_in_window > 0:
                 all_msgs = self.read_last_messages(msg["conv_row"], read_n)
-                ax_read_succeeded = bool(all_msgs)
-                if not ax_read_succeeded:
-                    # AX 读失败时不能回退到预览：预览可能是我方刚发的"好的"之类，
-                    # 会被误判成自回环。直接跳过本轮，下轮重试。
+                if not all_msgs:
                     logger.warning(
-                        "[%s] unread=%d 但 AX 读聊天面板失败，本轮跳过等待下轮重试",
-                        sender, unread_n,
+                        "[%s] AX 读聊天面板失败（可能被功能浮层遮挡），"
+                        "回退到预览处理（仅最后一条）",
+                        sender,
                     )
-                    continue
             if not all_msgs:
-                # 仅 unread=1 且无 bot_in_window 穿插：直接用预览
                 all_msgs = [msg["text"]]
 
             # 防自回环：计数式过滤。dq 已于上面清理过期项。
@@ -717,10 +729,10 @@ def _get_wecom_pid(bundle_id: str) -> int | None:
 
 def _press_conv_row(row) -> bool:
     """
-    点击会话行以切换到该会话。
-    尝试顺序：row.Press() → row 下首个 AXCell.Press() → setSelected → 鼠标点击坐标。
+    点击会话行以切换到该会话。**只用 AX 级操作，不使用鼠标事件**以避免抢焦点。
+    尝试顺序：row.Press/AXPress → AXCell.Press/AXPress → row.AXSelected = True。
     """
-    # 1. AXRow 自己（多数情况下不行）
+    # 1. AXRow 自己 / 内部 AXCell 的 Press 动作
     for target in (row, _deep_find_first(row, "AXCell", max_depth=2)):
         if target is None:
             continue
@@ -734,33 +746,16 @@ def _press_conv_row(row) -> bool:
                 except Exception as exc:
                     logger.debug("%s.%s 失败：%s", target.AXRole, action, exc)
 
-    # 2. 尝试设置 selected 属性
+    # 2. AXSelected 赋值（不切换可见面板，但不抢焦点；配合 send_reply 的 PostToPid
+    #    对输入框直接操作依然能发送成功）
     try:
         row.AXSelected = True
-        logger.debug("通过 AXSelected=True 切换会话成功")
+        logger.debug("通过 AXSelected=True 切换会话成功（可能未切换可见面板）")
         return True
     except Exception as exc:
         logger.debug("AXSelected 赋值失败：%s", exc)
 
-    # 3. 鼠标点击行中心坐标
-    try:
-        pos = row.AXPosition
-        size = row.AXSize
-        cx = pos.x + size.width / 2
-        cy = pos.y + size.height / 2
-        from atomacos import _a11y  # noqa
-        import Quartz
-        event_down = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown,
-                                                   (cx, cy), Quartz.kCGMouseButtonLeft)
-        event_up = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp,
-                                                 (cx, cy), Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
-        logger.debug("通过鼠标点击 (%.0f,%.0f) 切换会话", cx, cy)
-        return True
-    except Exception as exc:
-        logger.debug("鼠标点击失败：%s", exc)
-
+    # 3. 彻底失败（不使用 Quartz 鼠标点击，避免抢焦点）
     return False
 
 

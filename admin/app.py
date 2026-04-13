@@ -596,18 +596,6 @@ with tab_rules:
                 else:
                     st.warning("⚪ 无规则命中 → 将静默不回复")
 
-        with st.expander("正则语法速查"):
-            st.markdown(
-                """
-- `.` 任意一个字符　`.*` 任意多个
-- `^abc` 开头　`abc$` 结尾
-- `\\d` 数字　`\\w` 字母/数字/下划线　`\\s` 空白
-- `[甲乙丙]` 字符类，任一命中　`[^...]` 取反
-- `(?:a|b)` 或分支　`a{2,5}` 重复 2~5 次
-- **示例**：`价格|报价|多少钱` 一次命中三个关键词
-                """
-            )
-
     st.divider()
     st.subheader("回复规则配置")
 
@@ -635,6 +623,15 @@ with tab_rules:
                 else:
                     new_kw = None
                     new_pat = st.text_input("正则表达式", value=rule.get("pattern") or "", key=f"pat_{i}")
+                    with st.expander("📖 正则语法速查", expanded=False):
+                        st.markdown(
+                            "- `.` 任意字符　`.*` 任意多个\n"
+                            "- `^abc` 开头　`abc$` 结尾\n"
+                            "- `\\d` 数字　`\\w` 字母/数字/下划线　`\\s` 空白\n"
+                            "- `[甲乙丙]` 字符类　`[^...]` 取反\n"
+                            "- `(?:a|b)` 或分支　`a{2,5}` 重复 2-5 次\n"
+                            "- 示例：`价格|报价|多少钱` 一次命中三个关键词"
+                        )
                 new_reply = st.text_area("回复内容", value=rule.get("reply", ""), key=f"reply_{i}")
                 new_priority = st.number_input("优先级（越小越高）", value=rule.get("priority", 99), step=1, key=f"pri_{i}")
             with col2:
@@ -665,6 +662,16 @@ with tab_rules:
         n_name = c1.text_input("规则名称")
         n_match = c2.selectbox("匹配方式", ["exact", "contains", "regex"])
         n_kw = st.text_input("关键词 / 正则表达式")
+        if n_match == "regex":
+            with st.expander("📖 正则语法速查", expanded=True):
+                st.markdown(
+                    "- `.` 任意字符　`.*` 任意多个\n"
+                    "- `^abc` 开头　`abc$` 结尾\n"
+                    "- `\\d` 数字　`\\w` 字母/数字/下划线　`\\s` 空白\n"
+                    "- `[甲乙丙]` 字符类　`[^...]` 取反\n"
+                    "- `(?:a|b)` 或分支　`a{2,5}` 重复 2-5 次\n"
+                    "- 示例：`价格|报价|多少钱` 一次命中三个关键词"
+                )
         n_reply = st.text_area("回复内容")
         n_priority = st.number_input("优先级", value=len(rules) + 1, step=1)
         if st.form_submit_button("添加规则"):

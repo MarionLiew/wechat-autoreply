@@ -1,3 +1,14 @@
 {
-  "rules": []
+  "rules": [
+    {
+      "id": "rule_aa7a2f",
+      "enabled": true,
+      "name": "表情",
+      "match_type": "regex",
+      "keyword": null,
+      "pattern": "\\[.*\\]",
+      "reply": "[握手]",
+      "priority": 1
+    }
+  ]
 }

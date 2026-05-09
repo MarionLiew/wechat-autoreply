@@ -1137,6 +1137,110 @@ class WeChatWatcher:
             logger.debug("_find_xiansuo_links: %s", exc)
         return links
 
+    def _find_lead_popup(self):
+        """找当前打开的线索详情 popup 窗口（标题为空 + 尺寸合理 + 含'经营线索详情'）。"""
+        try:
+            wins = self._get_app().AXWindows
+        except Exception:
+            return None
+        for w in wins:
+            try:
+                title = str(getattr(w, "AXTitle", "") or "").strip()
+                sz = getattr(w, "AXSize", None)
+            except Exception:
+                continue
+            if title == "企业微信":
+                continue
+            if not sz or sz[0] < 300 or sz[1] < 300:
+                continue
+            # 浅扫看是否含 '经营线索详情' 标识，避免误抓其他独立窗口
+            for st in _deep_find_all(w, "AXStaticText", max_depth=8):
+                try:
+                    v = str(getattr(st, "AXValue", "") or "").strip()
+                except Exception:
+                    continue
+                if v == "经营线索详情":
+                    return w
+        return None
+
+    def _expand_member_info_section(self, popup, pid) -> bool:
+        """点击"会员信息"区下的'点击展开'，展开后能看到'是否添加企微'状态。
+
+        popup 里有 3 个'点击展开'，按 y 坐标升序，第一个属于会员信息区。
+        StaticText 自身不响应 PostToPid 鼠标点击的可能性较高，直接点
+        中心坐标即可（实测 PostToPid 鼠标对 Chromium 内嵌网页的 click
+        很可靠）。
+        """
+        import Quartz
+        expand_sts = []
+        for st in _deep_find_all(popup, "AXStaticText", max_depth=12):
+            try:
+                v = str(getattr(st, "AXValue", "") or "").strip()
+                if v != "点击展开":
+                    continue
+                pos = getattr(st, "AXPosition", None)
+                sz = getattr(st, "AXSize", None)
+                if pos and sz:
+                    expand_sts.append((pos, sz))
+            except Exception:
+                continue
+        if not expand_sts or not pid:
+            logger.debug("经营线索：未找到'点击展开'或缺 pid")
+            return False
+        expand_sts.sort(key=lambda x: x[0][1])  # y 升序
+        pos, sz = expand_sts[0]  # 最上面的 = 会员信息下的
+        cx = pos[0] + sz[0] / 2
+        cy = pos[1] + sz[1] / 2
+        try:
+            pt = Quartz.CGPointMake(cx, cy)
+            for et in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(None, et, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPostToPid(pid, ev)
+                time.sleep(0.05)
+            logger.info("经营线索：点击会员信息区 '点击展开' (%.0f, %.0f)", cx, cy)
+            return True
+        except Exception as exc:
+            logger.warning("经营线索：点击 点击展开 失败：%s", exc)
+            return False
+
+    def _read_qiwei_status(self, popup) -> str:
+        """读取 popup 里"是否添加企微"的状态。
+
+        实际 UI 格式未知（可能 'label + 是/否'，也可能 'label: 是'），
+        先把 popup 里 y < 1500 范围所有 StaticText 按位置 dump 到日志，
+        作为研究素材；同时尝试基于"添加企微"关键词附近找答案。
+        """
+        all_st = []
+        for st in _deep_find_all(popup, "AXStaticText", max_depth=12):
+            try:
+                v = str(getattr(st, "AXValue", "") or "").strip()
+                pos = getattr(st, "AXPosition", None)
+                if v and pos and pos[1] < 1500:
+                    all_st.append((pos[1], pos[0], v))
+            except Exception:
+                continue
+        all_st.sort()
+
+        # 诊断输出（前 30 条），方便研究展开后结构
+        logger.info("经营线索：popup StaticText 共 %d 条:", len(all_st))
+        for y, x, v in all_st[:30]:
+            logger.info("  y=%.0f x=%.0f %r", y, x, v)
+
+        # 尝试解析"添加企微"状态：找含'添加企微'的 label，
+        # 看其右侧或下方相邻 StaticText 是 '是' / '否' / '已添加' / '未添加'
+        for i, (y, x, v) in enumerate(all_st):
+            if "添加企微" not in v and "微信" not in v:
+                continue
+            # 右侧相邻（同 y±10，x 更大）
+            for y2, x2, v2 in all_st:
+                if abs(y2 - y) < 10 and x2 > x and v2 in ("是", "否", "已添加", "未添加"):
+                    return v2
+            # 下方相邻（y+30~80, 接近的 x）
+            for y2, x2, v2 in all_st:
+                if 20 < y2 - y < 80 and abs(x2 - x) < 50 and v2 in ("是", "否", "已添加", "未添加"):
+                    return v2
+        return "unknown"
+
     def _find_qulianxi(self, window):
         """在线索详情 popup 窗口里找 '去联系' 按钮（实测就是 AXButton）。
 
@@ -1277,6 +1381,22 @@ class WeChatWatcher:
             else:
                 logger.warning("经营线索：无法点击线索详情链接")
                 return
+
+        # 等 popup 加载完成（出现"会员信息"等稳定标识），最多 5s
+        time.sleep(0.5)
+        popup_win = None
+        for _ in range(10):
+            popup_win = self._find_lead_popup()
+            if popup_win is not None:
+                break
+            time.sleep(0.5)
+
+        # 展开"会员信息"区，读取"是否添加企微"状态用于诊断
+        if popup_win is not None:
+            self._expand_member_info_section(popup_win, pid)
+            time.sleep(1.2)  # 等展开动画
+            qiwei_status = self._read_qiwei_status(popup_win)
+            logger.info("经营线索：客户添加企微状态 = %r", qiwei_status)
 
         # 轮询等待"去联系"按钮出现（最多 8s，每 1s 检查一次）
         # 注意：客户未添加企微时，popup 里根本没有"去联系"按钮，永远等不到。

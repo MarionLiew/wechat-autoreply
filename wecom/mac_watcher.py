@@ -360,6 +360,38 @@ class WeChatWatcher:
         logger.warning("所有关闭浮层的尝试都失败了，可能需要人工介入")
         return False
 
+    def _find_conv_row_by_sender(self, expected_sender: str):
+        """按 sender 名在当前 conv_list 重新定位 AXRow。
+
+        必要原因：daemon 一轮 tick 内 parsed list 提前抓了一批 conv_row，
+        但每次切换聊天后 conv_list 可能重渲染（badge 变化、行重排），
+        导致 parsed 里的 row 引用 stale，AXPosition 拿不到、PostToPid
+        点击失败。每次切换前用 sender 主体名重新查找一遍最稳。
+        """
+        if not expected_sender:
+            return None
+        sender_core = expected_sender.split("(")[0].strip()
+        try:
+            window = self._get_main_window()
+            conv_list = self._find_conversation_list(window)
+        except Exception:
+            return None
+        for row in self._get_conversation_rows(conv_list):
+            try:
+                for st in _deep_find_all(row, "AXStaticText", max_depth=4):
+                    v = str(getattr(st, "AXValue", "") or "").strip()
+                    if not v:
+                        continue
+                    # 完整匹配 / 主体名匹配
+                    if v == expected_sender or v == sender_core:
+                        return row
+                    # 兼容预览中第一个 StaticText 是 sender_id（如 '刘明瑞(男)-3647'）
+                    if sender_core and sender_core in v and "(" in v:
+                        return row
+            except Exception:
+                continue
+        return None
+
     def _switch_to_conv_and_verify(
         self, conv_row, expected_sender: str = "",
         per_attempt_timeout: float = 3.0, attempts: int = 3,
@@ -386,17 +418,25 @@ class WeChatWatcher:
                 pass
             return out
 
+        pid = _get_wecom_pid(settings.wecom_bundle_id)
+
         for attempt in range(attempts):
-            # 切换会话：第一次用 AX-only Press（轻量、快），失败/重试改用
-            # PostToPid 鼠标强制点击会话行中心。后者突破 AXSelected 只"选中"
-            # 不切换可见面板的死局；PostToPid 定向投递不抢前台。
+            # 每次重试前重新定位 conv_row（避免 conv_list 重渲染导致的 stale ref）。
+            # 不传 expected_sender 时无法重新定位，回退用传入的 row。
+            if expected_sender:
+                fresh = self._find_conv_row_by_sender(expected_sender)
+                if fresh is not None:
+                    conv_row = fresh
+
+            # 切换会话：优先 PostToPid 鼠标点击（真实事件触发 visible panel 切换），
+            # 失败再用 AX 级 Press。注意 _press_conv_row 走 AXSelected 兜底时
+            # 只"选中"行不切换 panel——所以不能让它做主路径，否则 verify 会读到
+            # stale chat header（上一个 sender 的）造成连环误判。
             pressed = False
-            if attempt == 0:
-                pressed = _press_conv_row(conv_row)
+            if pid:
+                pressed = _force_click_conv_row(conv_row, pid)
             if not pressed:
-                pid = _get_wecom_pid(settings.wecom_bundle_id)
-                if pid:
-                    pressed = _force_click_conv_row(conv_row, pid)
+                pressed = _press_conv_row(conv_row)
             if not pressed:
                 logger.error("[%s] AX 与鼠标点击都未能切换会话", expected_sender or "?")
                 if attempt + 1 >= attempts:

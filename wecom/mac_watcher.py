@@ -243,13 +243,74 @@ class WeChatWatcher:
             except Exception:
                 continue
 
-        # 4: 现有的 AXCheckBox '展开' 控件
-        try:
-            if _dismiss_function_panel(window):
-                logger.info("浮层关闭：通过 AXCheckBox '展开'")
-                return True
-        except Exception as exc:
-            logger.debug("AXCheckBox 折叠失败：%s", exc)
+        # 4: AXCheckBox '收起' / '展开' 切换器（最可能有效的方式）
+        # title 反映"下一次点击的动作"：'收起' = 当前展开状态，点了会收起
+        # 优先 AXValue=0（直接设状态），再 PostToPid 鼠标点击（Chromium 对 AXPress
+        # 不可靠，但接受真实鼠标事件），最后才 AXPress。
+        for cb in _deep_find_all(window, "AXCheckBox", max_depth=10):
+            try:
+                title = str(getattr(cb, "AXTitle", "") or "").strip()
+                if title not in ("收起", "展开"):
+                    continue
+                value = getattr(cb, "AXValue", None)
+                logger.info("找到面板切换器 AXCheckBox title=%r value=%r", title, value)
+                # value=1 表示当前展开（=要关掉的状态）
+                if value not in (1, "1", True):
+                    # 已经收起了；说明聊天面板没被这个浮层遮挡，可能是别的原因
+                    continue
+
+                # 4a: AXValue 赋值
+                try:
+                    cb.AXValue = 0
+                    time.sleep(0.4)
+                    new_val = getattr(cb, "AXValue", None)
+                    if new_val in (0, "0", False):
+                        logger.info("浮层关闭：AXCheckBox '%s' AXValue=0 已生效", title)
+                        return True
+                    else:
+                        logger.debug("AXValue 赋值后值=%r，未生效，继续尝试", new_val)
+                except Exception as exc:
+                    logger.debug("AXValue 赋值失败：%s", exc)
+
+                # 4b: PostToPid 鼠标点击 checkbox 中心
+                try:
+                    import Quartz
+                    pid = _get_wecom_pid(settings.wecom_bundle_id)
+                    pos = getattr(cb, "AXPosition", None)
+                    sz = getattr(cb, "AXSize", None)
+                    if pid and pos and sz:
+                        cx = pos[0] + sz[0] / 2
+                        cy = pos[1] + sz[1] / 2
+                        pt = Quartz.CGPointMake(cx, cy)
+                        for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                            ev = Quartz.CGEventCreateMouseEvent(
+                                None, etype, pt, Quartz.kCGMouseButtonLeft,
+                            )
+                            Quartz.CGEventPostToPid(pid, ev)
+                            time.sleep(0.05)
+                        time.sleep(0.4)
+                        new_val = getattr(cb, "AXValue", None)
+                        if new_val in (0, "0", False):
+                            logger.info(
+                                "浮层关闭：PostToPid 点击 '%s' (%.0f,%.0f) 已生效",
+                                title, cx, cy,
+                            )
+                            return True
+                        else:
+                            logger.debug("PostToPid 点击后值=%r，未生效", new_val)
+                except Exception as exc:
+                    logger.debug("PostToPid 鼠标点击 AXCheckBox 失败：%s", exc)
+
+                # 4c: AXPress（最后兜底）
+                if _press(cb):
+                    time.sleep(0.4)
+                    new_val = getattr(cb, "AXValue", None)
+                    if new_val in (0, "0", False):
+                        logger.info("浮层关闭：AXCheckBox '%s' AXPress 已生效", title)
+                        return True
+                    logger.debug("AXPress 后值=%r，未生效", new_val)
+            except Exception:
+                continue
 
         # 5: 兜底——发 ESC 给企微 pid
         try:

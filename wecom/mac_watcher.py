@@ -51,6 +51,17 @@ class WeChatWatcher:
         # 超过 _echo_window_seconds 的老回复会被清理，对方日后再发同样文本不会被误过滤。
         from collections import deque
         self._recent_replies_by_sender: dict[str, deque[tuple[float, str]]] = {}
+        # bot 曾发出的所有回复文本，按 sender 分组（不过期）。
+        # 用于 WebArea 被功能浮层遮挡、只能读预览时的补充防回环：
+        # 若 preview 文本在此集合里，说明几乎肯定是 bot 自己发的，不应再回。
+        # 启动时从 DB 加载近 24h 记录，防止重启后丢失导致自回环。
+        self._bot_sent_texts: dict[str, set] = message_log.get_recent_bot_replies(hours=24)
+        # 内容级去重：记录每个 sender 上次成功回复时的消息集合（frozenset）。
+        # 不会因 sender 暂时离开未读列表而被清除，防止同批次消息被多次回复。
+        # 只有当新批次消息集合与上次不同时，才触发回复。
+        self._last_replied_batch: dict[str, frozenset] = {}
+        # 经营线索：已处理过的线索哈希（旅客文本 hash），防止重复点击同一线索
+        self._processed_leads: set[str] = set()
 
     # ------------------------------------------------------------------
     # App / Window helpers
@@ -69,7 +80,7 @@ class WeChatWatcher:
         return self._app
 
     def _get_main_window(self):
-        """返回企业微信主窗口。"""
+        """返回企业微信主窗口（title='企业微信' 的那个，跳过浮动输入法窗口）。"""
         app = self._get_app()
         try:
             windows = app.AXWindows
@@ -77,7 +88,22 @@ class WeChatWatcher:
             raise RuntimeError("无法枚举企业微信窗口") from exc
         if not windows:
             raise RuntimeError("企业微信没有已打开的窗口")
-        return windows[0]
+        # 优先找 title='企业微信' 的窗口，跳过输入法浮层或模态对话框
+        for w in windows:
+            try:
+                title = str(getattr(w, "AXTitle", "") or "")
+                if title == "企业微信":
+                    return w
+            except Exception:
+                pass
+        # 兜底：取面积最大的窗口
+        def _win_area(w):
+            try:
+                sz = getattr(w, "AXSize", None)
+                return (sz[0] * sz[1]) if sz else 0
+            except Exception:
+                return 0
+        return max(windows, key=_win_area)
 
     # ------------------------------------------------------------------
     # Unread conversation detection
@@ -162,107 +188,92 @@ class WeChatWatcher:
                 time.sleep(0.3)
         return []
 
-    def _try_read_last_messages(self, conv_row, count: int) -> list[str]:
-        # 从会话行拿期望的 sender 名字作为定位锚点
-        expected_sender = ""
-        try:
-            for t in _deep_find_all(conv_row, "AXStaticText", max_depth=5):
-                v = str(getattr(t, "AXValue", "") or "").strip()
-                if v:
-                    expected_sender = v
-                    break
-        except Exception:
-            pass
+    def _find_chat_scroll_area(self, window):
+        """定位聊天消息区的 AXScrollArea（宽>800、顶部 y<500、高度最大）。
 
+        企微 Mac 窗口固定有三个 ScrollArea：
+          [0] 会话列表  (宽~250)
+          [1] 聊天消息区 (宽~960, 高~1013)  ← 目标
+          [2] 输入框区   (宽~960, 高~179)
+        通过宽度 + 顶部位置 + 高度排除其他两个。
+        """
+        scrolls = _deep_find_all(window, "AXScrollArea", max_depth=10)
+        candidates = []
+        for s in scrolls:
+            pos = getattr(s, "AXPosition", None)
+            sz  = getattr(s, "AXSize", None)
+            if not pos or not sz:
+                continue
+            if sz[0] > 800 and pos[1] < 500:   # 宽且靠顶
+                candidates.append(s)
+        if not candidates:
+            return None
+        # 取高度最大的（聊天区 ~1013px，输入框 ~179px）
+        return max(candidates, key=lambda s: (getattr(s, "AXSize", None) or [0, 0])[1])
+
+    def _try_read_last_messages(self, conv_row, count: int) -> list[str]:
         if not _press_conv_row(conv_row):
             return []
-        time.sleep(0.6)  # 等聊天面板切换完成（原 0.35s 不够）
+        time.sleep(0.6)  # 等聊天面板切换完成
 
         try:
             window = self._get_main_window()
         except Exception:
             return []
 
-        # 聊天面板的 AXWebArea 有 desc=<客户名>；按 expected_sender 的主体部分匹配。
-        sender_core = expected_sender.split("(")[0].strip() if expected_sender else ""
-        all_webs = _deep_find_all(window, "AXWebArea", max_depth=15)
-
-        # 企微的功能浮层（desc 为这些的 WebArea 不是聊天内容）
-        FUNCTION_PANEL_DESCS = {
-            "经营大厅", "快捷回复", "人工客服", "快速会议",
-            "筛选", "批量处理", "搜索",
-        }
-
-        logger.debug(
-            "read_last_messages: expected=%r sender_core=%r, 共找到 %d 个 AXWebArea",
-            expected_sender, sender_core, len(all_webs),
-        )
-        for i, web in enumerate(all_webs):
-            logger.debug("  WebArea[%d] desc=%r", i,
-                         str(getattr(web, "AXDescription", "") or "")[:40])
-
-        chat_area = None
-        if sender_core and all_webs:
-            for web in all_webs:
-                desc = str(getattr(web, "AXDescription", "") or "").strip()
-                if not desc:
-                    continue
-                if desc in FUNCTION_PANEL_DESCS:
-                    continue
-                if desc == sender_core or sender_core in desc or desc in sender_core:
-                    chat_area = web
-                    logger.debug("匹配到 AXWebArea desc=%r", desc)
-                    break
-
-        # 兜底：排除功能浮层后选最后一个
-        if chat_area is None and all_webs:
-            non_panel_webs = [
-                w for w in all_webs
-                if str(getattr(w, "AXDescription", "") or "").strip()
-                not in FUNCTION_PANEL_DESCS
-            ]
-            if non_panel_webs:
-                chat_area = non_panel_webs[-1]
-                logger.debug("未精确匹配，使用非功能面板的最后 WebArea 兜底")
-            else:
-                logger.warning(
-                    "所有 AXWebArea 都是功能浮层 %s，放弃 AX 读取（回退到预览）",
-                    [str(getattr(w, "AXDescription", "") or "") for w in all_webs],
-                )
-
+        chat_area = self._find_chat_scroll_area(window)
         if chat_area is None:
+            logger.debug("read_last_messages: 未找到聊天消息 ScrollArea")
             return []
 
-        # 已知 UI 噪声（浮层/按钮/标签），不应作为消息内容
-        UI_NOISE = {
-            "@微信", "筛选", "搜索", "共", "条", "批量处理",
-            "经营大厅", "快捷回复", "人工客服", "快速会议",
-            "展开", "收起", "发送", "取消",
-        }
-        UI_NOISE_PREFIX = (
-            "您不是该客户绑定",
-            "对方默认同意存档",
+        panel_pos = getattr(chat_area, "AXPosition", None)
+        panel_sz  = getattr(chat_area, "AXSize", None)
+        if not panel_pos or not panel_sz:
+            logger.debug("read_last_messages: 聊天 ScrollArea 无坐标")
+            return []
+
+        # 中线 x：左侧 = 客户消息，右侧 = 我方消息（含企微欢迎语）
+        # 随窗口大小和位置动态计算，无需硬编码
+        midx = panel_pos[0] + panel_sz[0] / 2
+
+        tareas = _deep_find_all(chat_area, "AXTextArea", max_depth=15)
+        logger.debug(
+            "read_last_messages: 聊天区 AXTextArea %d 个，中线 x=%.0f",
+            len(tareas), midx,
         )
 
-        texts = _deep_find_all(chat_area, "AXStaticText", max_depth=15)
-        values: list[str] = []
-        for t in texts:
-            v = str(getattr(t, "AXValue", "") or "").strip()
-            if not v:
+        # 只保留客户消息（x < 中线）；我方消息（欢迎语、bot回复）在右侧，跳过
+        incoming: list[tuple[float, str]] = []
+        for t in tareas:
+            pos = getattr(t, "AXPosition", None)
+            val = str(getattr(t, "AXValue", "") or "").strip()
+            if not val or not pos:
                 continue
-            if not _is_message_text(v):
-                continue
-            if v in UI_NOISE:
-                continue
-            if any(v.startswith(p) for p in UI_NOISE_PREFIX):
-                continue
-            values.append(v)
+            if pos[0] >= midx:
+                continue   # 右侧 = 我方，跳过
+            incoming.append((pos[1], val))  # (y 坐标, 文本)
+
+        if not incoming:
+            logger.debug("read_last_messages: 聊天区无客户侧 AXTextArea")
+            return []
+
+        # 按 y 坐标分组，合并同行碎片（Chromium 有时把一条消息拆成多个 AXTextArea）
+        from collections import defaultdict as _dd
+        by_y: dict = _dd(list)
+        for y, val in incoming:
+            by_y[round(y)].append(val)
+
+        messages: list[str] = []
+        for y in sorted(by_y.keys()):
+            text = "".join(by_y[y]).strip()
+            if text and _is_message_text(text):
+                messages.append(text)
 
         logger.debug(
-            "read_last_messages: 聊天区原始 StaticText %d 个，过滤后 %d 个，返回最后 %d 条",
-            len(texts), len(values), min(count, len(values)),
+            "read_last_messages: 客户消息 %d 行（原始碎片 %d 个），返回最后 %d 条",
+            len(messages), len(incoming), min(count, len(messages)),
         )
-        return values[-count:] if values else []
+        return messages[-count:] if messages else []
 
     def _find_chat_area(self, window):
         """
@@ -348,15 +359,12 @@ class WeChatWatcher:
 
     def send_reply(self, reply_text: str, conv_row=None) -> tuple[bool, str]:
         """
-        将回复文本写入输入框并发送。
+        将回复文本写入输入框并发送（全程后台运行，不激活窗口）。
 
-        发送前会点击目标会话行以切换到该会话；会短暂把企业微信拉到前台。
+        发送前会通过 AX 选中目标会话行以切换到该会话，不抢占窗口焦点。
         """
         try:
-            app = self._get_app()
-            if not settings.silent_send:
-                app.activate()
-                time.sleep(0.2)
+            self._get_app()
             window = self._get_main_window()
         except Exception as exc:
             logger.error("获取主窗口失败：%s", exc)
@@ -366,36 +374,164 @@ class WeChatWatcher:
             if not _press_conv_row(conv_row):
                 logger.error("切换到目标会话失败（所有 Press 策略都不可用）")
                 return False, ""
-            time.sleep(0.3)
+            time.sleep(1.0)  # 等 Chromium 完成聊天面板渲染（0.3s 不够）
 
-        # 深度遍历找所有 AXTextArea；输入框通常是最后一个（聊天区右下）
-        text_areas = _deep_find_all(window, "AXTextArea", max_depth=12)
-        # 过滤掉带 AXValue='BOT' 或只读的（如消息列表中的 BOT 标签）
-        candidates = []
-        for ta in text_areas:
+        # 找经营大厅等功能浮层的坐标范围，用于排除其内部的 text area
+        FUNCTION_PANEL_DESCS = {"经营大厅", "快捷回复", "人工客服", "快速会议", "筛选", "批量处理", "搜索"}
+
+        def _scan_panel_rects():
+            rects = []
+            all_descs = []
+            for w in _deep_find_all(window, "AXWebArea", max_depth=15):
+                try:
+                    desc = str(getattr(w, "AXDescription", "") or "").strip()
+                    all_descs.append(desc)
+                    if desc not in FUNCTION_PANEL_DESCS:
+                        continue
+                    pos = getattr(w, "AXPosition", None)
+                    size = getattr(w, "AXSize", None)
+                    if pos and size:
+                        rects.append((pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]))
+                except Exception:
+                    pass
+            logger.info("AXWebArea 扫描：共 %d 个，desc=%s，命中浮层=%d 个",
+                        len(all_descs), all_descs, len(rects))
+            return rects
+
+        panel_rects = _scan_panel_rects()
+
+        # 功能浮层（经营大厅等）打开时，Chromium 键盘焦点在浮层 WebView，
+        # CGEventPostToPid(Enter) 会路由到浮层而非聊天输入框，导致发送失败。
+        # 解决方案：先通过 AX 折叠浮层，让焦点回到聊天区，再发送。
+        if panel_rects:
+            logger.info("检测到功能浮层（%d 个），尝试折叠以恢复键盘焦点…", len(panel_rects))
+            _collapsed = False
+            for cb in _deep_find_all(window, "AXCheckBox", max_depth=15):
+                try:
+                    title = str(getattr(cb, "AXTitle", "") or "").strip()
+                    if title in ("展开", "收起"):
+                        press_fn = getattr(cb, "Press", None)
+                        if callable(press_fn):
+                            press_fn()
+                            logger.info("已按下折叠控件（AXCheckBox title='%s'）", title)
+                            _collapsed = True
+                            break
+                except Exception as exc:
+                    logger.debug("折叠控件操作失败: %s", exc)
+            if _collapsed:
+                # 等待 Chromium 处理折叠动画并把焦点切回聊天区
+                time.sleep(1.5)
+                panel_rects = _scan_panel_rects()
+                if not panel_rects:
+                    logger.info("功能浮层已折叠，键盘焦点应已恢复到聊天区")
+                else:
+                    logger.warning("折叠后浮层仍存在（panel_rects=%s），发送可能仍失败", panel_rects)
+            else:
+                logger.warning("未找到折叠控件（AXCheckBox），发送时 Enter 可能路由到浮层")
+
+        def _in_panel_rect(node) -> bool:
+            if not panel_rects:
+                return False
+            try:
+                pos = getattr(node, "AXPosition", None)
+                if pos:
+                    nx, ny = pos[0], pos[1]
+                    for (x0, y0, x1, y1) in panel_rects:
+                        if x0 <= nx <= x1 and y0 <= ny <= y1:
+                            return True
+            except Exception:
+                pass
+            return False
+
+        # 找聊天输入框：
+        # WeCom 会话列表每行有一个 AXTextArea，值为 'BOT' 或 'BOT\u200b'（含零宽空格）。
+        # 实际聊天输入框是另一个 AXTextArea，位于窗口右侧（x 坐标 > 1200）。
+        # 策略：先用位置坐标筛（x > conversation_list_right），再按 BOT 标记过滤兜底。
+
+        # 估算会话列表右边界（取所有 BOT 标记中最大 x + 元素宽度）
+        conv_list_right = 0
+        text_areas_all = _deep_find_all(window, "AXTextArea", max_depth=15)
+        bot_count = 0
+        for ta in text_areas_all:
             try:
                 val = str(getattr(ta, "AXValue", "") or "")
-                # 排除显示为 'BOT' 的标签；真正的输入框 AXValue 一般为空
-                if val.strip() == "BOT":
+                if val.replace('\u200b', '').strip() == "BOT":
+                    bot_count += 1
+                    pos = getattr(ta, "AXPosition", None)
+                    sz = getattr(ta, "AXSize", None)
+                    if pos and sz:
+                        right = pos[0] + sz[0]
+                        if right > conv_list_right:
+                            conv_list_right = right
+            except Exception:
+                pass
+        if conv_list_right == 0:
+            conv_list_right = 900  # 经验值：会话列表通常在 900px 以内
+        logger.info(
+            "AXTextArea 总数=%d，BOT 标记=%d 个，会话列表右边界≈%d",
+            len(text_areas_all), bot_count, conv_list_right,
+        )
+
+        # 候选：非 BOT 标记、不在功能浮层内
+        # 输入框特征：width > 500 且 height > 50（消息气泡通常只有 9×22）
+        candidates = []
+        excluded_by_rect = []
+        for ta in text_areas_all:
+            try:
+                val = str(getattr(ta, "AXValue", "") or "")
+                # 跳过会话列表 BOT 标记（含零宽空格的变体）
+                if val.replace('\u200b', '').strip() == "BOT":
+                    continue
+                if _in_panel_rect(ta):
+                    excluded_by_rect.append(ta)
                     continue
                 candidates.append(ta)
             except Exception:
                 candidates.append(ta)
 
-        if not candidates:
-            logger.error("找不到输入框（AXTextArea），共 %d 个候选", len(text_areas))
-            return False, ""
+        # 优先取尺寸最大的（聊天输入框 ~960×118，消息气泡 ~9×22）
+        def _area(ta):
+            try:
+                sz = getattr(ta, "AXSize", None)
+                return (sz[0] * sz[1]) if sz else 0
+            except Exception:
+                return 0
 
-        input_box = candidates[-1]
-        logger.debug("选用输入框：AXValue=%r", getattr(input_box, "AXValue", ""))
+        candidates.sort(key=_area)
+
+        if not candidates:
+            if excluded_by_rect:
+                logger.warning(
+                    "所有非 BOT AXTextArea(%d 个) 均被 panel_rect 过滤，回退使用最大的",
+                    len(excluded_by_rect),
+                )
+                excluded_by_rect.sort(key=_area)
+                candidates = excluded_by_rect
+            else:
+                logger.error(
+                    "找不到聊天输入框（AXTextArea 共 %d 个，BOT=%d 个）",
+                    len(text_areas_all), bot_count,
+                )
+                return False, ""
+
+        # 优先选空值的 AXTextArea（聊天输入框通常为空，消息气泡有内容）
+        empty_candidates = [
+            c for c in candidates
+            if not str(getattr(c, "AXValue", "") or "").strip()
+        ]
+        input_box = (empty_candidates[-1] if empty_candidates else candidates[-1])
+        try:
+            pos = getattr(input_box, "AXPosition", None)
+            sz = getattr(input_box, "AXSize", None)
+            val_preview = str(getattr(input_box, "AXValue", "") or "")[:30]
+            logger.info(
+                "选用输入框：pos=%s size=%s val=%r（共 %d 个候选，BOT=%d 个）",
+                pos, sz, val_preview, len(candidates), bot_count,
+            )
+        except Exception:
+            pass
 
         try:
-            try:
-                input_box.AXFocused = True
-            except Exception:
-                pass
-            time.sleep(0.1)
-
             # 写入文本：按顺序尝试多种 API，记录实际用的方法
             used_method = ""
             for name, setter in (
@@ -417,71 +553,450 @@ class WeChatWatcher:
             time.sleep(0.15)
             enter_method = ""
 
-            # ① 元素级 Confirm / AXConfirm（最干净，不需要焦点）
-            for act in ("Confirm", "AXConfirm"):
-                fn = getattr(input_box, act, None)
-                if callable(fn):
-                    try:
-                        fn()
-                        enter_method = act
-                        break
-                    except Exception as exc:
-                        logger.debug("%s 失败：%s", act, exc)
-
-            # ② 元素级 sendKeys 回车（只在非静默模式用；静默时企微不响应此事件）
-            if not enter_method and not settings.silent_send:
+            def _verify_sent():
+                """检查输入框是否已清空（消息已发送）。
+                只在 AXValue 能正常读取且值为空时返回 True；
+                若读取异常或返回 None（AX 引用失效），一律返回 False，
+                避免切前台后引用失效导致假阳性。
+                """
                 try:
-                    input_box.sendKeys("\r")
-                    enter_method = "sendKeys(\\r)"
-                except Exception as exc:
-                    logger.debug("元素 sendKeys 回车失败：%s", exc)
+                    raw = input_box.AXValue  # 会在失效时抛异常
+                    box_val = str(raw or "")
+                    return not box_val.strip()
+                except Exception:
+                    return False
 
-            # ③ Quartz 事件：优先定向投递到企微 PID（真正静默），失败才临时激活
+            # ① 鼠标点击输入框中心（CGEventCreateMouseEvent + CGEventPostToPid）
+            # probe 已验证：写文字 → PostToPid 鼠标点击 → PostToPid Enter → 成功发送
+            # 注意：点击后不重写 AXValue、不设 AXFocused（会破坏 Chromium 内部焦点）
             if not enter_method:
                 import Quartz
                 pid = _get_wecom_pid(settings.wecom_bundle_id)
-
-                if settings.silent_send and pid:
-                    # 定向投递：不需要激活窗口
+                if pid and pos and sz:
                     try:
+                        cx = pos[0] + sz[0] / 2
+                        cy = pos[1] + sz[1] / 2
+                        logger.info("鼠标点击输入框：pid=%s 坐标=(%.0f, %.0f)", pid, cx, cy)
+                        point = Quartz.CGPointMake(cx, cy)
+                        ev_down = Quartz.CGEventCreateMouseEvent(
+                            None, Quartz.kCGEventLeftMouseDown, point, Quartz.kCGMouseButtonLeft
+                        )
+                        Quartz.CGEventPostToPid(pid, ev_down)
+                        time.sleep(0.05)
+                        ev_up = Quartz.CGEventCreateMouseEvent(
+                            None, Quartz.kCGEventLeftMouseUp, point, Quartz.kCGMouseButtonLeft
+                        )
+                        Quartz.CGEventPostToPid(pid, ev_up)
+                        time.sleep(0.5)  # 等待 Chromium 处理点击并建立内部焦点（延长以适应聊天切换后状态）
+                        val_before_enter = str(getattr(input_box, "AXValue", "") or "")
+                        logger.info("PostToPid Enter 前输入框值：%r", val_before_enter[:30])
+                        # 若点击导致文本被清除（select-all+overwrite），补写一次
+                        if not val_before_enter.strip():
+                            logger.info("点击后文本被清除，补写")
+                            try:
+                                setattr(input_box, "AXValue", reply_text)
+                                time.sleep(0.05)
+                            except Exception as exc:
+                                logger.warning("补写文本失败：%s", exc)
+                        # 直接发 Enter（鼠标点击已让 Chromium 获得内部焦点）
                         for down in (True, False):
                             ev = Quartz.CGEventCreateKeyboardEvent(None, 36, down)
                             Quartz.CGEventPostToPid(pid, ev)
-                        enter_method = f"Quartz→pid{pid}"
+                        time.sleep(0.3)
+                        val_after_enter = str(getattr(input_box, "AXValue", "") or "")
+                        logger.info("PostToPid Enter 后输入框值：%r", val_after_enter[:30])
+                        if _verify_sent():
+                            enter_method = f"MouseClick+Enter→pid{pid}"
+                        else:
+                            logger.warning(
+                                "鼠标点击+Enter 后输入框仍有文本（%r），Enter 未生效",
+                                val_after_enter[:30],
+                            )
                     except Exception as exc:
-                        logger.debug("CGEventPostToPid 失败：%s", exc)
+                        logger.warning("鼠标点击+Enter 失败：%s", exc)
+                else:
+                    logger.info("跳过鼠标点击：pid=%s pos=%s sz=%s", pid, pos, sz)
 
-                # 兜底：临时激活 + HIDEventTap + 还原焦点
-                if not enter_method:
-                    prev_app = None
+            # ② 切前台 + PostToPid 鼠标 + PostToPid Enter
+            # 逻辑：先让企微成为 OS key window（osascript set frontmost），
+            # 再 PostToPid 鼠标点击输入框（让 Chromium 把内部焦点给输入框），
+            # 再 PostToPid Enter（企微是 key window + Chromium 焦点在输入框 → 成功）。
+            # probe 测试已证明"鼠标 PostToPid + Enter PostToPid"在企微刚激活时可行；
+            # 此处主动先激活，确保条件成立。
+            if not enter_method and pos and sz and pid:
+                try:
+                    import subprocess
+                    # Step 1: 切前台，记录前任前台 app
+                    make_front_script = (
+                        'tell application "System Events"\n'
+                        '    set prevApp to name of first process whose frontmost is true\n'
+                        '    set frontmost of (first process whose bundle identifier is "'
+                        + settings.wecom_bundle_id
+                        + '") to true\n'
+                        '    delay 0.2\n'
+                        '    return prevApp\n'
+                        'end tell\n'
+                    )
+                    r1 = subprocess.run(
+                        ["osascript", "-e", make_front_script],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    prev_app = r1.stdout.strip()
+                    logger.info("切前台完成，prev=%r", prev_app)
+
+                    # Step 2: PostToPid 鼠标点击输入框（企微已是前台，Chromium 会接受焦点）
+                    import Quartz as _Q
+                    cx2 = pos[0] + sz[0] / 2
+                    cy2 = pos[1] + sz[1] / 2
+                    pt = _Q.CGPointMake(cx2, cy2)
+                    _Q.CGEventPostToPid(pid, _Q.CGEventCreateMouseEvent(
+                        None, _Q.kCGEventLeftMouseDown, pt, _Q.kCGMouseButtonLeft))
+                    time.sleep(0.05)
+                    _Q.CGEventPostToPid(pid, _Q.CGEventCreateMouseEvent(
+                        None, _Q.kCGEventLeftMouseUp, pt, _Q.kCGMouseButtonLeft))
+                    time.sleep(0.1)
+
+                    # Step 3: 重写文本（点击可能清除原内容）
                     try:
-                        from AppKit import NSWorkspace
-                        prev_app = NSWorkspace.sharedWorkspace().frontmostApplication()
+                        setattr(input_box, "AXValue", reply_text)
+                        time.sleep(0.05)
                     except Exception:
                         pass
-                    try:
-                        self._get_app().activate()
-                        time.sleep(0.15)
-                        for down in (True, False):
-                            ev = Quartz.CGEventCreateKeyboardEvent(None, 36, down)
-                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-                        enter_method = "Quartz(activate)"
-                        time.sleep(0.1)
-                        if settings.silent_send and prev_app is not None:
-                            try:
-                                prev_app.activateWithOptions_(0)
-                            except Exception:
-                                pass
-                    except Exception as exc:
-                        logger.error("Quartz 回车也失败：%s", exc)
-                        return False, ""
+
+                    # Step 4: PostToPid Enter（企微是 key window，Chromium 焦点在输入框）
+                    logger.info("flash-front+PostToPid-mouse+Enter（坐标=%.0f,%.0f）", cx2, cy2)
+                    for down in (True, False):
+                        ev = _Q.CGEventCreateKeyboardEvent(None, 36, down)
+                        _Q.CGEventPostToPid(pid, ev)
+                    time.sleep(0.3)
+
+                    # Step 5: 切回原前台
+                    if prev_app:
+                        try:
+                            subprocess.run(
+                                ["osascript", "-e",
+                                 f'tell application "System Events" to set frontmost of process "{prev_app}" to true'],
+                                capture_output=True, timeout=2,
+                            )
+                        except Exception:
+                            pass
+
+                    if _verify_sent():
+                        enter_method = "flash-front+PostToPid-mouse+Enter"
+                    else:
+                        logger.warning("flash-front+PostToPid-mouse+Enter 后输入框仍有文本")
+                except Exception as exc:
+                    logger.warning("flash-front+PostToPid-mouse+Enter 异常：%s", exc)
+
+            # ③ sendKeys("\r") 兜底
+            if not enter_method:
+                try:
+                    input_box.sendKeys("\r")
+                    time.sleep(0.3)
+                    if _verify_sent():
+                        enter_method = "sendKeys(\\r)"
+                    else:
+                        logger.warning("sendKeys 回车后输入框仍有文本，Enter 未生效")
+                except Exception as exc:
+                    logger.debug("sendKeys 回车失败：%s", exc)
 
             method_label = f"{used_method}+{enter_method}"
-            logger.info("已发送回复（方式=%s）：%s", method_label, reply_text[:60])
-            return True, method_label
+            if enter_method:
+                logger.info("已发送回复（方式=%s）：%s", method_label, reply_text[:60])
+                return True, method_label
+            else:
+                logger.error("所有发送方式均失败（输入框未清空），放弃")
+                return False, ""
         except Exception as exc:
             logger.error("发送回复失败：%s", exc)
             return False, ""
+
+    # ------------------------------------------------------------------
+    # 经营线索 处理
+    # ------------------------------------------------------------------
+
+    def _find_xiansuo_links(self, chat_scroll) -> list:
+        """在聊天滚动区域找所有 '线索详情>>' AXLink 元素（只遍历已渲染的可见行）。"""
+        links = []
+        try:
+            for child in _safe_children(chat_scroll):
+                if str(getattr(child, "AXRole", "") or "") != "AXTable":
+                    continue
+                for row in _safe_children(child):
+                    if str(getattr(row, "AXRole", "") or "") != "AXRow":
+                        continue
+                    for cell in _safe_children(row):
+                        for ck in _safe_children(cell):
+                            if str(getattr(ck, "AXRole", "") or "") != "AXTextArea":
+                                continue
+                            for lk in _safe_children(ck):
+                                if str(getattr(lk, "AXRole", "") or "") == "AXLink":
+                                    title = str(getattr(lk, "AXTitle", "") or "")
+                                    if "线索详情" in title:
+                                        links.append(lk)
+        except Exception as exc:
+            logger.debug("_find_xiansuo_links: %s", exc)
+        return links
+
+    def _find_qulianxi(self, window):
+        """在所有窗口中找 '去联系' 按钮/链接（线索详情 popup 可能是独立窗口）。"""
+        # 线索详情弹窗可能是独立的 AXWindow，扫描 app 的所有窗口
+        try:
+            app = self._get_app()
+            all_wins = app.AXWindows
+            logger.info("经营线索：当前共 %d 个窗口", len(all_wins))
+            for w in all_wins:
+                title = str(getattr(w, "AXTitle", "") or "")
+                sz    = getattr(w, "AXSize", None)
+                pos   = getattr(w, "AXPosition", None)
+                logger.info("  Window title=%r pos=%s sz=%s", title, pos, sz)
+                # 浅搜该窗口直接子树（depth=8）
+                for role in ("AXButton", "AXLink", "AXStaticText"):
+                    for elem in _deep_find_all(w, role, max_depth=8):
+                        title_e = str(getattr(elem, "AXTitle", "") or "")
+                        val_e   = str(getattr(elem, "AXValue", "") or "")
+                        if "去联系" in title_e or "去联系" in val_e:
+                            epos = getattr(elem, "AXPosition", None)
+                            logger.info("  -> 找到 %s '去联系' at %s (window=%r)", role, epos, title)
+                            return elem
+        except Exception as exc:
+            logger.debug("_find_qulianxi all_wins error: %s", exc)
+
+        # 兜底：在主窗口内搜
+        for role in ("AXButton", "AXLink", "AXStaticText"):
+            for elem in _deep_find_all(window, role, max_depth=12):
+                title = str(getattr(elem, "AXTitle", "") or "")
+                val   = str(getattr(elem, "AXValue", "") or "")
+                if "去联系" in title or "去联系" in val:
+                    return elem
+        return None
+
+    def _handle_jingying_leads(self, conv_row) -> None:
+        """
+        经营线索处理：切换到经营线索聊天 → 找最新未处理线索 → 点击"线索详情>>"
+        → 等待 webview 加载 → 点击"去联系"。
+        """
+        import Quartz
+
+        logger.info("经营线索：开始处理线索…")
+
+        if not _press_conv_row(conv_row):
+            logger.warning("经营线索：切换聊天窗口失败")
+            return
+        time.sleep(0.8)
+
+        try:
+            window = self._get_main_window()
+        except Exception as exc:
+            logger.warning("经营线索：获取主窗口失败：%s", exc)
+            return
+
+        pid = _get_wecom_pid(settings.wecom_bundle_id)
+        if not pid:
+            logger.warning("经营线索：无法获取 WeCom PID")
+            return
+
+        # 找聊天消息滚动区
+        chat_scroll = self._find_chat_scroll_area(window)
+        if chat_scroll is None:
+            logger.warning("经营线索：未找到聊天滚动区")
+            return
+
+        # 找所有"线索详情>>"链接
+        links = self._find_xiansuo_links(chat_scroll)
+        logger.info("经营线索：找到 %d 个线索详情链接", len(links))
+        if not links:
+            return
+
+        # 取最后一条（最新线索），检查是否已处理过
+        lk = links[-1]
+        try:
+            parent_val = str(getattr(lk.AXParent, "AXValue", "") or "")
+        except Exception:
+            parent_val = repr(getattr(lk, "AXPosition", ""))
+        lead_hash = hashlib.sha256(parent_val.encode()).hexdigest()
+
+        if lead_hash in self._processed_leads:
+            logger.info("经营线索：最新线索已处理过，跳过")
+            return
+
+        # 点击"线索详情>>"：优先 AXPress（后台安全），其次 PostToPid 坐标点击
+        clicked_link = False
+        for ax_action in ("Press", "AXPress"):
+            fn = getattr(lk, ax_action, None)
+            if callable(fn):
+                try:
+                    fn()
+                    logger.info("经营线索：%s 线索详情成功", ax_action)
+                    clicked_link = True
+                    break
+                except Exception as exc:
+                    logger.debug("经营线索：%s 线索详情失败：%s", ax_action, exc)
+
+        if not clicked_link:
+            lk_pos = getattr(lk, "AXPosition", None)
+            if lk_pos:
+                cx = lk_pos[0] + 36
+                cy = lk_pos[1] + 11
+                logger.info("经营线索：PostToPid 点击线索详情 (%.0f, %.0f)", cx, cy)
+                pt = Quartz.CGPointMake(cx, cy)
+                for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(None, etype, pt, Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPostToPid(pid, ev)
+                    time.sleep(0.05)
+            else:
+                logger.warning("经营线索：无法点击线索详情链接")
+                return
+
+        # 轮询等待"去联系"按钮出现（最多 15s，每 1s 检查一次）
+        qulianxi = None
+        for attempt in range(15):
+            time.sleep(1.0)
+            try:
+                window = self._get_main_window()
+            except Exception:
+                continue
+            qulianxi = self._find_qulianxi(window)
+            if qulianxi is not None:
+                logger.info("经营线索：找到去联系按钮（第 %d 次轮询）", attempt + 1)
+                break
+            logger.debug("经营线索：第 %d 次轮询未找到去联系，继续等待…", attempt + 1)
+
+        if qulianxi is None:
+            logger.warning("经营线索：15s 内未找到去联系按钮，放弃")
+            self._close_xiansuo_popups()
+            return
+
+        # 点击"去联系"：优先 AXPress（背景安全），失败再用 PostToPid 坐标点击
+        ql_clicked = False
+        for ax_action in ("Press", "AXPress"):
+            fn = getattr(qulianxi, ax_action, None)
+            if callable(fn):
+                try:
+                    fn()
+                    logger.info("经营线索：%s 去联系成功", ax_action)
+                    ql_clicked = True
+                    break
+                except Exception as exc:
+                    logger.debug("经营线索：%s 去联系失败：%s", ax_action, exc)
+
+        if not ql_clicked:
+            ql_pos = getattr(qulianxi, "AXPosition", None)
+            if ql_pos:
+                cx = ql_pos[0] + 20
+                cy = ql_pos[1] + 10
+                logger.info("经营线索：PostToPid 点击去联系 (%.0f, %.0f)", cx, cy)
+                pt = Quartz.CGPointMake(cx, cy)
+                for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(None, etype, pt, Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPostToPid(pid, ev)
+                    time.sleep(0.05)
+                ql_clicked = True
+            else:
+                logger.warning("经营线索：无法点击去联系按钮")
+                return
+
+        self._processed_leads.add(lead_hash)
+        logger.info("经营线索：已点击去联系（线索 hash=%s）", lead_hash[:12])
+
+        # 等待确认弹窗（"确定跳转" 对话框）出现
+        time.sleep(1.5)
+        self._click_confirm_dialog(pid)
+
+        # 清理残留的线索详情弹窗（防止窗口堆积）
+        time.sleep(0.5)
+        self._close_xiansuo_popups()
+
+    def _click_confirm_dialog(self, pid) -> None:
+        """点击"确定"/"确定跳转" 确认弹窗。"""
+        import Quartz
+        try:
+            app = self._get_app()
+            all_wins = app.AXWindows
+        except Exception:
+            return
+
+        for w in all_wins:
+            for btn in _deep_find_all(w, "AXButton", max_depth=6):
+                title = str(getattr(btn, "AXTitle", "") or "").strip()
+                if title in ("确定", "确定跳转", "跳转", "OK"):
+                    logger.info("经营线索：找到确认按钮 '%s'，点击", title)
+                    # 先尝试 AXPress
+                    for ax_action in ("Press", "AXPress"):
+                        fn = getattr(btn, ax_action, None)
+                        if callable(fn):
+                            try:
+                                fn()
+                                logger.info("经营线索：%s 确认成功", ax_action)
+                                return
+                            except Exception as exc:
+                                logger.debug("经营线索：%s 确认失败：%s", ax_action, exc)
+                    # 兜底：坐标点击
+                    btn_pos = getattr(btn, "AXPosition", None)
+                    btn_sz  = getattr(btn, "AXSize", None)
+                    if btn_pos and btn_sz and pid:
+                        cx = btn_pos[0] + btn_sz[0] / 2
+                        cy = btn_pos[1] + btn_sz[1] / 2
+                        pt = Quartz.CGPointMake(cx, cy)
+                        for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                            ev = Quartz.CGEventCreateMouseEvent(None, etype, pt, Quartz.kCGMouseButtonLeft)
+                            Quartz.CGEventPostToPid(pid, ev)
+                            time.sleep(0.05)
+                        logger.info("经营线索：PostToPid 确认 (%.0f, %.0f)", cx, cy)
+                    return
+
+        logger.debug("经营线索：未找到确认弹窗（可能不需要确认）")
+
+    def _close_xiansuo_popups(self) -> None:
+        """关闭所有残留的线索详情弹窗（非主窗口）。"""
+        try:
+            app = self._get_app()
+            all_wins = list(app.AXWindows)
+            # 主窗口 = 宽度最大的那个
+            main_win = max(
+                all_wins,
+                key=lambda w: (getattr(w, "AXSize", None) or [0])[0],
+                default=None,
+            )
+            main_w = (getattr(main_win, "AXSize", None) or [0])[0] if main_win else 0
+
+            closed = 0
+            for w in all_wins:
+                w_sz = getattr(w, "AXSize", None)
+                if not w_sz:
+                    continue
+                # 跳过主窗口
+                if w_sz[0] >= main_w * 0.9:
+                    continue
+                # 先试 AXCloseButton subrole
+                for btn in _deep_find_all(w, "AXButton", max_depth=3):
+                    sub = str(getattr(btn, "AXSubrole", "") or "").strip()
+                    if sub == "AXCloseButton":
+                        for action in ("Press", "AXPress"):
+                            fn = getattr(btn, action, None)
+                            if callable(fn):
+                                try:
+                                    fn()
+                                    closed += 1
+                                    logger.info("经营线索：关闭弹窗（sz=%s）", w_sz)
+                                    break
+                                except Exception:
+                                    pass
+                        break
+                else:
+                    # 没找到 AXCloseButton，用 AXCancel 或 ESC
+                    try:
+                        w.AXCancel()
+                        closed += 1
+                    except Exception:
+                        pass
+
+            if closed:
+                logger.info("经营线索：共关闭 %d 个弹窗", closed)
+            else:
+                logger.debug("经营线索：无弹窗可关闭（共 %d 个窗口）", len(all_wins))
+        except Exception as exc:
+            logger.debug("_close_xiansuo_popups: %s", exc)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -490,8 +1005,7 @@ class WeChatWatcher:
     def tick(self) -> None:
         """单次轮询：检查未读 → 提取 → 回复 → 记录。
 
-        注意：不在轮询阶段抢占前台，避免每 5 秒把企业微信拉到最前。
-        只有在需要发送回复时，send_reply() 内部会短暂激活窗口。
+        注意：全程后台运行，不抢占前台，不激活窗口。
         """
         try:
             self._get_app()  # 仅获取引用，不 activate
@@ -533,6 +1047,12 @@ class WeChatWatcher:
                 self._last_text_by_sender[sender] = msg["text"]
                 continue
 
+            # 经营线索：特殊处理——点击线索详情 → 去联系，不走普通回复流程
+            if "经营线索" in sender:
+                self._handle_jingying_leads(msg["conv_row"])
+                self._last_text_by_sender[sender] = msg["text"]
+                continue
+
             if settings.is_sender_excluded(sender):
                 logger.info("排除名单命中，跳过 [%s]", sender)
                 self._last_text_by_sender[sender] = msg["text"]
@@ -553,12 +1073,23 @@ class WeChatWatcher:
                 all_msgs = self.read_last_messages(msg["conv_row"], read_n)
                 if not all_msgs:
                     logger.warning(
-                        "[%s] AX 读聊天面板失败（可能被功能浮层遮挡），"
-                        "回退到预览处理（仅最后一条）",
+                        "[%s] AX 读聊天面板失败，回退到预览处理（仅最后一条）",
                         sender,
                     )
+            using_preview = not all_msgs  # 标记是否回退到了预览（WebArea 不可用）
             if not all_msgs:
                 all_msgs = [msg["text"]]
+                # 补充防回环：preview 模式下若文本是 bot 本会话曾发出的回复，
+                # 几乎可以确定是自己的消息，跳过。
+                # （echo_protect_seconds 到期 + _last_text_by_sender 被清空后的兜底）
+                bot_ever_sent = self._bot_sent_texts.get(sender, set())
+                if bot_ever_sent and all(m in bot_ever_sent for m in all_msgs):
+                    logger.info(
+                        "跳过 [%s]：preview '%s' 匹配 bot 会话历史回复，非新客户消息",
+                        sender, all_msgs[0][:40],
+                    )
+                    self._last_text_by_sender[sender] = msg["text"]
+                    continue
 
             # 防自回环：计数式过滤。dq 已于上面清理过期项。
             from collections import Counter as _C
@@ -594,6 +1125,16 @@ class WeChatWatcher:
                 self._last_text_by_sender[sender] = msg["text"]
                 continue
             all_msgs = filtered_msgs
+
+            # 内容级去重：若这批客户消息与上次成功回复时完全相同，跳过
+            content_batch = frozenset(all_msgs)
+            if content_batch and content_batch == self._last_replied_batch.get(sender):
+                logger.info(
+                    "跳过 [%s]：消息内容与上次回复时完全相同（内容级去重）",
+                    sender,
+                )
+                self._last_text_by_sender[sender] = msg["text"]
+                continue
 
             combined_text = "\n".join(all_msgs)
             logger.info(
@@ -657,11 +1198,17 @@ class WeChatWatcher:
             latency_ms = int((time.monotonic() - t_start) * 1000)
             if sent:
                 self._processed.add(msg["msg_hash"])
-                self._last_text_by_sender[sender] = msg["text"]
+                # 内容级去重：记录本次回复的消息集合，下次见到相同集合直接跳过
+                self._last_replied_batch[sender] = content_batch
+                # 存 reply 而非客户消息：发送后企微 session 预览会更新为 bot 回复内容，
+                # 下轮 extract_last_message 读到的预览是 bot 的回复，需与此对上才能去重。
+                self._last_text_by_sender[sender] = result["content"]
                 # 记录我方刚发出的回复，下一轮若 AX 读到相同文本应视为自己的消息
                 from collections import deque as _dq
                 dq = self._recent_replies_by_sender.setdefault(sender, _dq(maxlen=20))
                 dq.append((time.time(), result["content"]))
+                # 记录本会话所有已发出的回复文本，供 preview 模式下的补充防回环使用
+                self._bot_sent_texts.setdefault(sender, set()).add(result["content"])
                 message_log.save(
                     msg_hash=msg["msg_hash"],
                     customer_id=sender,
@@ -699,6 +1246,52 @@ def _safe_children(element) -> list:
         return []
 
 
+def _find_send_button(input_box, window):
+    """
+    找聊天输入框旁的"发送" AXButton。
+    策略：从 input_box 向上最多 6 层找父节点，在每层的浅层子树里找 title='发送' 的按钮。
+    找不到时回退到全窗口浅搜。
+    """
+    node = input_box
+    for _ in range(6):
+        try:
+            parent = getattr(node, "AXParent", None)
+            if parent is None:
+                break
+            for btn in _deep_find_all(parent, "AXButton", max_depth=3):
+                try:
+                    if str(getattr(btn, "AXTitle", "") or "").strip() == "发送":
+                        return btn
+                except Exception:
+                    pass
+            node = parent
+        except Exception:
+            break
+    # 全窗口浅搜兜底
+    for btn in _deep_find_all(window, "AXButton", max_depth=8):
+        try:
+            if str(getattr(btn, "AXTitle", "") or "").strip() == "发送":
+                return btn
+        except Exception:
+            pass
+    return None
+
+
+def _deep_find_first_match(root, target, max_depth: int = 10) -> bool:
+    """判断 target 是否在 root 的子树里（引用相等）。"""
+    if max_depth < 0:
+        return False
+    try:
+        if root is target:
+            return True
+    except Exception:
+        pass
+    for child in _safe_children(root):
+        if _deep_find_first_match(child, target, max_depth - 1):
+            return True
+    return False
+
+
 def _deep_find_first(root, role: str, max_depth: int = 10):
     """深度优先遍历，返回第一个 AXRole == role 的节点；找不到返回 None。"""
     if max_depth < 0:
@@ -725,6 +1318,95 @@ def _get_wecom_pid(bundle_id: str) -> int | None:
     except Exception:
         pass
     return None
+
+
+def _dump_ax_tree(root, filepath: str, max_depth: int = 8) -> None:
+    """把 AX 树结构写入文件，用于调试。"""
+    lines = []
+
+    def _walk(node, depth):
+        if depth > max_depth:
+            return
+        indent = "  " * depth
+        try:
+            role = str(getattr(node, "AXRole", "") or "")
+            title = str(getattr(node, "AXTitle", "") or "")[:40]
+            desc = str(getattr(node, "AXDescription", "") or "")[:40]
+            value = str(getattr(node, "AXValue", "") or "")[:60]
+            label = str(getattr(node, "AXRoleDescription", "") or "")[:30]
+            lines.append(f"{indent}{role}  title={title!r}  desc={desc!r}  value={value!r}  label={label!r}")
+        except Exception as e:
+            lines.append(f"{indent}[err: {e}]")
+            return
+        for child in _safe_children(node):
+            _walk(child, depth + 1)
+
+    _walk(root, 0)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        logger.info("AX 树已写入 %s（共 %d 行）", filepath, len(lines))
+    except Exception as e:
+        logger.warning("写 AX 树失败：%s", e)
+
+
+def _dismiss_function_panel(window, panel_names: list[str] | None = None) -> bool:
+    """
+    通过 AXCheckBox title='展开' 折叠企微功能浮层面板（经营大厅等）。
+    该控件位于快速会议按钮右侧，点击可收起/展开右侧功能面板。
+    """
+    for node in _deep_find_all(window, "AXCheckBox", max_depth=10):
+        try:
+            title = str(getattr(node, "AXTitle", "") or "").strip()
+            if title == "展开":
+                for action in ("Press", "AXPress"):
+                    fn = getattr(node, action, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                            logger.info("已通过 AXCheckBox('展开') 折叠功能浮层")
+                            return True
+                        except Exception as exc:
+                            logger.debug("AXCheckBox Press 失败：%s", exc)
+        except Exception:
+            continue
+    return False
+
+
+def _read_chat_from_table(window, count: int) -> list[str]:
+    """
+    当 AXWebArea 被功能浮层遮挡时，从右侧面板的 AXTable 直接读聊天消息。
+    只扫浅层（depth=4），避免全树 DFS 超时。
+    """
+    UI_NOISE = {
+        "@微信", "筛选", "搜索", "共", "条", "批量处理",
+        "经营大厅", "快捷回复", "人工客服", "快速会议",
+        "展开", "收起", "发送", "取消",
+    }
+    UI_NOISE_PREFIX = ("您不是该客户绑定", "对方默认同意存档")
+
+    # 找所有 AXTable（浅扫），跳过第一个（左侧会话列表）
+    tables = _deep_find_all(window, "AXTable", max_depth=6)
+    if len(tables) < 2:
+        logger.debug("_read_chat_from_table: 找到 %d 个 AXTable，不足 2 个", len(tables))
+        return []
+
+    for table in tables[1:]:
+        texts_raw = _deep_find_all(table, "AXStaticText", max_depth=5)
+        values = []
+        for t in texts_raw:
+            v = str(getattr(t, "AXValue", "") or "").strip()
+            if not v or not _is_message_text(v):
+                continue
+            if v in UI_NOISE or any(v.startswith(p) for p in UI_NOISE_PREFIX):
+                continue
+            values.append(v)
+        if values:
+            logger.info("从 AXTable 读到 %d 条消息（绕过功能浮层）", len(values))
+            return values[-count:]
+
+    logger.debug("_read_chat_from_table: 所有 AXTable 均无有效消息")
+    return []
 
 
 def _press_conv_row(row) -> bool:
@@ -776,13 +1458,23 @@ def _deep_find_all(root, role: str, max_depth: int = 10) -> list:
 
 def _is_message_text(text: str) -> bool:
     """
-    过滤掉时间戳、空字符串等非消息内容。
+    过滤掉时间戳、相对时间标签、空字符串等非消息内容。
     时间戳示例："12:30"、"昨天 18:00"、"2024-01-01"
+    相对时间示例："刚刚"、"1分钟前"、"2小时前"、"昨天"、"前天"
     """
-    if not text or len(text) < 2:
+    if not text:
         return False
-    # 过滤纯时间/日期格式（简单启发式）
     import re
-    if re.fullmatch(r"[\d:年月日/\-\s]+", text):
+    # 过滤时间/日期格式（必须像真实时间戳：含冒号的时间、含分隔符的日期）
+    # 避免把 "1"、"42" 等纯数字短消息误当时间过滤
+    if re.fullmatch(
+        r"\d{1,2}:\d{2}"                        # 12:30
+        r"|\d{2,4}[-/]\d{1,2}([-/]\d{1,2})?"   # 04-14 / 2024-04-14
+        r"|\d{4}年\d{1,2}月(\d{1,2}日)?",       # 2024年4月14日
+        text,
+    ):
+        return False
+    # 过滤相对时间标签
+    if re.fullmatch(r"刚刚|\d+分钟前|\d+小时前|昨天|前天|星期[一二三四五六日]", text):
         return False
     return True

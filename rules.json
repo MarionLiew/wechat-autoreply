@@ -9,6 +9,17 @@
       "pattern": "\\[.*\\]",
       "reply": "[握手]",
       "priority": 1
+    },
+    {
+      "id": "rule_62f5ce",
+      "enabled": true,
+      "name": "谢谢",
+      "match_type": "contains",
+      "keyword": "谢谢",
+      "pattern": null,
+      "reply": "不客气～",
+      "priority": 2,
+      "ignore_case": false
     }
   ]
 }

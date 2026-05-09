@@ -108,6 +108,24 @@ def get_by_sender(sender: str, limit: int = 5) -> list[MessageLog]:
         return list(reversed(rows))  # 返回时按时间升序
 
 
+def get_recent_bot_replies(hours: int = 24) -> dict:
+    """Return {customer_id: set(reply_text)} for bot replies sent in the last N hours.
+
+    Used on startup to repopulate _bot_sent_texts so the self-reply guard
+    survives daemon restarts.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    with Session() as s:
+        rows = s.execute(
+            select(MessageLog.customer_id, MessageLog.reply)
+            .where(MessageLog.created_at >= cutoff)
+        ).fetchall()
+    result: dict = {}
+    for cid, reply in rows:
+        result.setdefault(cid, set()).add(reply)
+    return result
+
+
 def get_recent_logs(limit: int = 200) -> list[MessageLog]:
     """Return the most recent message logs (for admin UI)."""
     with Session() as s:

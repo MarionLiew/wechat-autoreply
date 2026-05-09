@@ -148,16 +148,23 @@ class WeChatWatcher:
     }
 
     def _active_chat_sender(self, window) -> str:
-        """返回当前活跃聊天面板的客户名（从 AXWebArea AXDescription 读）。
+        """返回当前活跃聊天面板的客户名/sender ID。
 
-        企微 Mac：聊天面板的 AXWebArea desc 即为客户名（如 '邢晓红'）。
-        若窗口里有多个 WebArea（含功能浮层），跳过功能浮层 desc 后取第一个。
-        若 panel 还在加载或不存在，返回 ''。
+        策略 A：从 AXWebArea AXDescription 读（普通情况下，desc 即客户名）。
+                跳过功能浮层 desc。
+
+        策略 B：当 A 拿不到（AXWebArea 缺失/atomacos 'system memory failure'
+                等异常），读 chat header AXStaticText 兜底——企微 chat header
+                在 x≈459,y≈266 处显示当前聊天 sender 全称（如 '刘明瑞(男)-3647'），
+                这是经营大厅等浮层并存时仍可访问的稳定信号。
+
+        都拿不到返回 ''。
         """
+        # 策略 A：AXWebArea desc
         try:
             webs = _deep_find_all(window, "AXWebArea", max_depth=15)
         except Exception:
-            return ""
+            webs = []
         for w in webs:
             try:
                 desc = str(getattr(w, "AXDescription", "") or "").strip()
@@ -166,6 +173,31 @@ class WeChatWatcher:
             if not desc or desc in self._FUNCTION_PANEL_DESCS:
                 continue
             return desc
+
+        # 策略 B：chat header 上的 AXStaticText
+        # chat header 是 chat 区域顶部的客户名标签，位置：x 400-1100, y 200-320
+        # 通常格式为 '<名>(<性别>)-<id>'（如 '刘明瑞(男)-3647'），有时是公众号名等
+        try:
+            sts = _deep_find_all(window, "AXStaticText", max_depth=8)
+        except Exception:
+            return ""
+        for st in sts:
+            try:
+                pos = getattr(st, "AXPosition", None)
+                if not pos:
+                    continue
+                x, y = pos[0], pos[1]
+                if not (400 <= x <= 1100 and 200 <= y <= 320):
+                    continue
+                val = str(getattr(st, "AXValue", "") or "").strip()
+                if not val:
+                    continue
+                # 排除已知噪声标签
+                if val in ("@微信", "经营线索", "客户联系") or val.startswith(("4月", "5月", "6月")):
+                    continue
+                return val
+            except Exception:
+                continue
         return ""
 
     def _try_dismiss_covering_panel(self, window) -> bool:

@@ -168,6 +168,105 @@ class WeChatWatcher:
             return desc
         return ""
 
+    def _try_dismiss_covering_panel(self, window) -> bool:
+        """尝试关闭遮挡聊天面板的功能浮层（如 '客户经营专区'、'经营大厅'）。
+
+        按优先级尝试：
+        1. 浮层 WebArea 子树里 AXSubrole='AXCloseButton' 的按钮
+        2. 浮层 WebArea 子树里 title 含 '关闭'/'收起'/'返回'/'退出'/'×' 的按钮/链接
+        3. 浮层 WebArea 父节点附近的 AXCloseButton（标题栏关闭按钮）
+        4. 现有 _dismiss_function_panel（AXCheckBox title='展开'）
+        5. 兜底：发 ESC 键给企微 pid（Mac 上多数 popup 接受 ESC 关闭）
+        """
+        # 先找出当前所有功能浮层 WebArea
+        panel_webs = []
+        try:
+            for w in _deep_find_all(window, "AXWebArea", max_depth=15):
+                try:
+                    desc = str(getattr(w, "AXDescription", "") or "").strip()
+                except Exception:
+                    continue
+                if desc in self._FUNCTION_PANEL_DESCS:
+                    panel_webs.append((desc, w))
+        except Exception:
+            pass
+
+        def _press(node) -> bool:
+            for action in ("Press", "AXPress"):
+                fn = getattr(node, action, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        return True
+                    except Exception:
+                        continue
+            return False
+
+        # 1+2: 浮层 WebArea 子树里找关闭控件
+        for desc, web in panel_webs:
+            for role in ("AXButton", "AXLink"):
+                for btn in _deep_find_all(web, role, max_depth=10):
+                    try:
+                        sub = str(getattr(btn, "AXSubrole", "") or "").strip()
+                        t = str(getattr(btn, "AXTitle", "") or "").strip()
+                    except Exception:
+                        continue
+                    is_close = (
+                        sub == "AXCloseButton"
+                        or t in ("关闭", "收起", "返回", "退出", "×", "X", "x")
+                        or "关闭" in t
+                    )
+                    if is_close and _press(btn):
+                        logger.info(
+                            "浮层关闭：在 [%s] 子树点击 %s（title=%r sub=%r）",
+                            desc, role, t, sub,
+                        )
+                        return True
+
+        # 3: 浮层 WebArea 父节点附近找 AXCloseButton
+        for desc, web in panel_webs:
+            try:
+                node = web
+                for _ in range(4):
+                    parent = getattr(node, "AXParent", None)
+                    if parent is None:
+                        break
+                    for btn in _deep_find_all(parent, "AXButton", max_depth=3):
+                        try:
+                            sub = str(getattr(btn, "AXSubrole", "") or "").strip()
+                        except Exception:
+                            continue
+                        if sub == "AXCloseButton" and _press(btn):
+                            logger.info("浮层关闭：[%s] 父节点 AXCloseButton", desc)
+                            return True
+                    node = parent
+            except Exception:
+                continue
+
+        # 4: 现有的 AXCheckBox '展开' 控件
+        try:
+            if _dismiss_function_panel(window):
+                logger.info("浮层关闭：通过 AXCheckBox '展开'")
+                return True
+        except Exception as exc:
+            logger.debug("AXCheckBox 折叠失败：%s", exc)
+
+        # 5: 兜底——发 ESC 给企微 pid
+        try:
+            import Quartz
+            pid = _get_wecom_pid(settings.wecom_bundle_id)
+            if pid:
+                for down in (True, False):
+                    ev = Quartz.CGEventCreateKeyboardEvent(None, 53, down)  # 53 = kVK_Escape
+                    Quartz.CGEventPostToPid(pid, ev)
+                logger.info("浮层关闭：兜底发 ESC 给 pid=%s", pid)
+                return True
+        except Exception as exc:
+            logger.debug("ESC 兜底失败：%s", exc)
+
+        logger.warning("所有关闭浮层的尝试都失败了，可能需要人工介入")
+        return False
+
     def _switch_to_conv_and_verify(
         self, conv_row, expected_sender: str = "",
         per_attempt_timeout: float = 3.0, attempts: int = 3,
@@ -241,11 +340,16 @@ class WeChatWatcher:
             if attempt + 1 < attempts and covering_panel:
                 try:
                     window = self._get_main_window()
-                    if _dismiss_function_panel(window):
-                        logger.info("[%s] 已折叠功能浮层，准备重试切换", expected_sender)
-                        time.sleep(1.2)  # 等折叠动画 + 聊天面板重新渲染
+                    if self._try_dismiss_covering_panel(window):
+                        logger.info("[%s] 已尝试关闭浮层，等待重试切换", expected_sender)
+                        time.sleep(1.2)  # 等关闭动画 + 聊天面板重新渲染
+                    else:
+                        logger.warning(
+                            "[%s] 浮层关闭失败，下一轮切换可能仍受遮挡",
+                            expected_sender,
+                        )
                 except Exception as exc:
-                    logger.debug("折叠功能浮层失败：%s", exc)
+                    logger.debug("关闭浮层异常：%s", exc)
 
         logger.error(
             "[%s] 多次切换会话仍未让 panel 与目标 sender 一致，放弃此次操作",

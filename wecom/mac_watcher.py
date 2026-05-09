@@ -140,8 +140,10 @@ class WeChatWatcher:
     # ------------------------------------------------------------------
 
     # 功能浮层 desc 白名单（这些 WebArea 不算"当前聊天客户"）
+    # 注意：当浮层完全遮挡聊天面板时，仅靠跳过其 desc 还原不出真正的 sender，
+    # 需要在 _switch_to_conv_and_verify 里主动调用 _dismiss_function_panel 折叠浮层。
     _FUNCTION_PANEL_DESCS = {
-        "经营大厅", "快捷回复", "人工客服", "快速会议",
+        "经营大厅", "客户经营专区", "快捷回复", "人工客服", "快速会议",
         "筛选", "批量处理", "搜索",
     }
 
@@ -168,17 +170,29 @@ class WeChatWatcher:
 
     def _switch_to_conv_and_verify(
         self, conv_row, expected_sender: str = "",
-        per_attempt_timeout: float = 3.0, attempts: int = 2,
+        per_attempt_timeout: float = 3.0, attempts: int = 3,
     ) -> bool:
         """点击会话行 → 轮询 panel desc 直到匹配 expected_sender。
 
         - expected_sender 含括号/性别/ID（如 '邢晓红(女)-7658'），
           匹配时只取首个 '(' 之前的主体（'邢晓红'），与 panel desc 双向 contains。
-        - 单次尝试最多 per_attempt_timeout 秒；不匹配会再点一次重试。
+        - 单次尝试最多 per_attempt_timeout 秒；不匹配则尝试折叠功能浮层再点一次。
         - expected_sender 为空时不做校验，仅 press + 等 1.0s（向后兼容）。
         - 全部失败返回 False，调用方应放弃发送/读取，避免打到错误聊天。
         """
         sender_core = expected_sender.split("(")[0].strip() if expected_sender else ""
+
+        # 检测到这种"非目标"的全局 desc 时，认定有功能浮层遮挡，先折叠再重试
+        def _all_descs(window) -> list[str]:
+            out = []
+            try:
+                for w in _deep_find_all(window, "AXWebArea", max_depth=15):
+                    d = str(getattr(w, "AXDescription", "") or "").strip()
+                    if d:
+                        out.append(d)
+            except Exception:
+                pass
+            return out
 
         for attempt in range(attempts):
             if not _press_conv_row(conv_row):
@@ -194,6 +208,7 @@ class WeChatWatcher:
 
             deadline = time.monotonic() + per_attempt_timeout
             seen: set[str] = set()
+            covering_panel = False  # 此次轮询是否看到功能浮层遮挡迹象
             while time.monotonic() < deadline:
                 try:
                     window = self._get_main_window()
@@ -209,13 +224,28 @@ class WeChatWatcher:
                             expected_sender, cur, attempt + 1,
                         )
                         return True
+                else:
+                    # 当前没有"非功能浮层"的 chat WebArea；看一下是不是被功能浮层完全遮住
+                    descs = _all_descs(window)
+                    if descs and any(d in self._FUNCTION_PANEL_DESCS for d in descs):
+                        covering_panel = True
                 time.sleep(0.2)
 
             logger.warning(
-                "切换到 [%s] 失败：%.1fs 内 panel desc 未匹配（core=%r seen=%s），第 %d/%d 次",
+                "切换到 [%s] 失败：%.1fs 内 panel desc 未匹配（core=%r seen=%s 浮层遮挡=%s），第 %d/%d 次",
                 expected_sender, per_attempt_timeout, sender_core,
-                sorted(seen)[:5], attempt + 1, attempts,
+                sorted(seen)[:5], covering_panel, attempt + 1, attempts,
             )
+
+            # 失败后若仍有重试机会，且检测到功能浮层遮挡，先折叠再下一轮
+            if attempt + 1 < attempts and covering_panel:
+                try:
+                    window = self._get_main_window()
+                    if _dismiss_function_panel(window):
+                        logger.info("[%s] 已折叠功能浮层，准备重试切换", expected_sender)
+                        time.sleep(1.2)  # 等折叠动画 + 聊天面板重新渲染
+                except Exception as exc:
+                    logger.debug("折叠功能浮层失败：%s", exc)
 
         logger.error(
             "[%s] 多次切换会话仍未让 panel 与目标 sender 一致，放弃此次操作",
@@ -500,8 +530,7 @@ class WeChatWatcher:
             # _switch_to_conv_and_verify 内部已 poll 等切换完成，无需额外 sleep
 
         # 找经营大厅等功能浮层的坐标范围，用于排除其内部的 text area
-        FUNCTION_PANEL_DESCS = {"经营大厅", "快捷回复", "人工客服", "快速会议", "筛选", "批量处理", "搜索"}
-
+        # 与 _FUNCTION_PANEL_DESCS 共用，保证两条逻辑（识别+遮挡判定）一致
         def _scan_panel_rects():
             rects = []
             all_descs = []
@@ -509,7 +538,7 @@ class WeChatWatcher:
                 try:
                     desc = str(getattr(w, "AXDescription", "") or "").strip()
                     all_descs.append(desc)
-                    if desc not in FUNCTION_PANEL_DESCS:
+                    if desc not in self._FUNCTION_PANEL_DESCS:
                         continue
                     pos = getattr(w, "AXPosition", None)
                     size = getattr(w, "AXSize", None)

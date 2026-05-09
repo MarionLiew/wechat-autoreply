@@ -1138,36 +1138,67 @@ class WeChatWatcher:
         return links
 
     def _find_qulianxi(self, window):
-        """在所有窗口中找 '去联系' 按钮/链接（线索详情 popup 可能是独立窗口）。"""
-        # 线索详情弹窗可能是独立的 AXWindow，扫描 app 的所有窗口
+        """在线索详情 popup 窗口里找 '去联系' 按钮（实测就是 AXButton）。
+
+        优化前：扫所有窗口（含主窗口）的 AXButton+AXLink+AXStaticText，深度 8，
+        单次轮询 ~70s，15 次轮询要 17.5 分钟，期间 daemon 卡死。
+        优化后：跳过主窗口（去联系只在 popup 里）、主搜 AXButton、深度 6，
+        单次 ~1-2s。
+        """
         try:
             app = self._get_app()
             all_wins = app.AXWindows
-            logger.info("经营线索：当前共 %d 个窗口", len(all_wins))
-            for w in all_wins:
-                title = str(getattr(w, "AXTitle", "") or "")
-                sz    = getattr(w, "AXSize", None)
-                pos   = getattr(w, "AXPosition", None)
-                logger.info("  Window title=%r pos=%s sz=%s", title, pos, sz)
-                # 浅搜该窗口直接子树（depth=8）
-                for role in ("AXButton", "AXLink", "AXStaticText"):
-                    for elem in _deep_find_all(w, role, max_depth=8):
-                        title_e = str(getattr(elem, "AXTitle", "") or "")
-                        val_e   = str(getattr(elem, "AXValue", "") or "")
-                        if "去联系" in title_e or "去联系" in val_e:
-                            epos = getattr(elem, "AXPosition", None)
-                            logger.info("  -> 找到 %s '去联系' at %s (window=%r)", role, epos, title)
-                            return elem
-        except Exception as exc:
-            logger.debug("_find_qulianxi all_wins error: %s", exc)
+        except Exception:
+            return None
 
-        # 兜底：在主窗口内搜
-        for role in ("AXButton", "AXLink", "AXStaticText"):
-            for elem in _deep_find_all(window, role, max_depth=12):
-                title = str(getattr(elem, "AXTitle", "") or "")
-                val   = str(getattr(elem, "AXValue", "") or "")
-                if "去联系" in title or "去联系" in val:
-                    return elem
+        # 筛选 popup 窗口（非主窗口，且有合理尺寸）
+        popup_wins = []
+        for w in all_wins:
+            try:
+                title = str(getattr(w, "AXTitle", "") or "").strip()
+                sz = getattr(w, "AXSize", None)
+            except Exception:
+                continue
+            if title == "企业微信":
+                continue
+            if not sz or sz[0] < 300 or sz[1] < 300:
+                continue
+            popup_wins.append((title, w))
+
+        if not popup_wins:
+            return None
+
+        # 主路径：扫 popup 的 AXButton
+        for title, w in popup_wins:
+            for btn in _deep_find_all(w, "AXButton", max_depth=6):
+                try:
+                    title_e = str(getattr(btn, "AXTitle", "") or "")
+                except Exception:
+                    continue
+                if "去联系" in title_e:
+                    pos = getattr(btn, "AXPosition", None)
+                    logger.info(
+                        "经营线索：找到 AXButton '去联系' at %s (popup title=%r)",
+                        pos, title,
+                    )
+                    return btn
+
+        # 兜底：popup 内 AXLink/AXStaticText（极少见情况）
+        for title, w in popup_wins:
+            for role in ("AXLink", "AXStaticText"):
+                for elem in _deep_find_all(w, role, max_depth=6):
+                    try:
+                        t = str(getattr(elem, "AXTitle", "") or "")
+                        v = str(getattr(elem, "AXValue", "") or "")
+                    except Exception:
+                        continue
+                    if "去联系" in t or "去联系" in v:
+                        pos = getattr(elem, "AXPosition", None)
+                        logger.info(
+                            "经营线索：找到 %s '去联系' at %s (popup title=%r)",
+                            role, pos, title,
+                        )
+                        return elem
         return None
 
     def _handle_jingying_leads(self, conv_row) -> None:

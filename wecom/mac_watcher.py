@@ -355,8 +355,18 @@ class WeChatWatcher:
             return out
 
         for attempt in range(attempts):
-            if not _press_conv_row(conv_row):
-                logger.error("[%s] _press_conv_row 全部策略失败", expected_sender or "?")
+            # 切换会话：第一次用 AX-only Press（轻量、快），失败/重试改用
+            # PostToPid 鼠标强制点击会话行中心。后者突破 AXSelected 只"选中"
+            # 不切换可见面板的死局；PostToPid 定向投递不抢前台。
+            pressed = False
+            if attempt == 0:
+                pressed = _press_conv_row(conv_row)
+            if not pressed:
+                pid = _get_wecom_pid(settings.wecom_bundle_id)
+                if pid:
+                    pressed = _force_click_conv_row(conv_row, pid)
+            if not pressed:
+                logger.error("[%s] AX 与鼠标点击都未能切换会话", expected_sender or "?")
                 if attempt + 1 >= attempts:
                     return False
                 time.sleep(0.5)
@@ -1739,6 +1749,33 @@ def _read_chat_from_table(window, count: int) -> list[str]:
 
     logger.debug("_read_chat_from_table: 所有 AXTable 均无有效消息")
     return []
+
+
+def _force_click_conv_row(row, pid) -> bool:
+    """PostToPid 鼠标点击会话行中心，强制让 Chromium 切换可见聊天面板。
+
+    与 _press_conv_row（仅 AX 操作）不同，这里用真实鼠标事件触发 Chromium
+    内部的会话切换，能突破 AXSelected = True 兜底"只选中不切换面板"的死局。
+    PostToPid 定向投递事件给指定 pid，不让该 app 进入前台/抢焦点。
+    """
+    try:
+        import Quartz
+        pos = getattr(row, "AXPosition", None)
+        sz  = getattr(row, "AXSize", None)
+        if not pid or not pos or not sz:
+            return False
+        cx = pos[0] + sz[0] / 2
+        cy = pos[1] + sz[1] / 2
+        pt = Quartz.CGPointMake(cx, cy)
+        for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+            ev = Quartz.CGEventCreateMouseEvent(None, etype, pt, Quartz.kCGMouseButtonLeft)
+            Quartz.CGEventPostToPid(pid, ev)
+            time.sleep(0.05)
+        logger.info("PostToPid 强制点击会话行中心 pid=%s (%.0f, %.0f)", pid, cx, cy)
+        return True
+    except Exception as exc:
+        logger.warning("PostToPid 点击会话行失败：%s", exc)
+        return False
 
 
 def _press_conv_row(row) -> bool:

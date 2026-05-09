@@ -1278,9 +1278,11 @@ class WeChatWatcher:
                 logger.warning("经营线索：无法点击线索详情链接")
                 return
 
-        # 轮询等待"去联系"按钮出现（最多 15s，每 1s 检查一次）
+        # 轮询等待"去联系"按钮出现（最多 8s，每 1s 检查一次）
+        # 注意：客户未添加企微时，popup 里根本没有"去联系"按钮，永远等不到。
+        # 实测 popup 加载好后 ~3-4s 内"去联系"会出现；超过 8s 仍没就视为未添加。
         qulianxi = None
-        for attempt in range(15):
+        for attempt in range(8):
             time.sleep(1.0)
             try:
                 window = self._get_main_window()
@@ -1293,7 +1295,13 @@ class WeChatWatcher:
             logger.debug("经营线索：第 %d 次轮询未找到去联系，继续等待…", attempt + 1)
 
         if qulianxi is None:
-            logger.warning("经营线索：15s 内未找到去联系按钮，放弃")
+            # 标记此线索已处理，避免下一轮 tick 重复打开 popup 死循环。
+            # 客户未添加企微 → 没有去联系按钮 → 此线索目前无法自动处理，跳过。
+            self._processed_leads.add(lead_hash)
+            logger.warning(
+                "经营线索：未找到去联系按钮（客户可能未添加企微），跳过此线索 hash=%s",
+                lead_hash[:12],
+            )
             self._close_xiansuo_popups()
             return
 

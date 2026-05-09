@@ -106,6 +106,124 @@ class WeChatWatcher:
         return max(windows, key=_win_area)
 
     # ------------------------------------------------------------------
+    # 出方向（我方/系统）模板识别
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_outgoing_template(text: str) -> bool:
+        """识别"客户经理新加好友的欢迎语 / 系统提示"等出方向模板。
+
+        预览文本无法区分出入方向（与 read_last_messages 用 midx 区分不同），
+        而企微在新加好友后系统/客户经理会自动推欢迎语，conv_row 把它显示为
+        "未读"预览，bot 若不识别就会去回复自己刚发的开场白，造成连环误发。
+
+        命中关键词组合即视为出方向，跳过。
+        """
+        if not text:
+            return False
+        t = text.replace(" ", "")
+        # 1. 企微"我已经添加了你"系统消息
+        if "我已经添加了你" in t and "可以开始聊天" in t:
+            return True
+        # 2. 南航客户经理欢迎模板：含"南方航空" + ("客户经理"|"为您提供"|"感谢您选择")
+        if "南方航空" in t and (
+            "客户经理" in t or "为您提供" in t or "感谢您选择" in t
+        ):
+            return True
+        # 3. 营销/活动模板（生日有礼、🎁 开头活动文案等）
+        if t.startswith("🎁") or "生日有礼" in t or "生日赢好礼" in t:
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # 当前活跃聊天面板识别 + 会话切换校验
+    # ------------------------------------------------------------------
+
+    # 功能浮层 desc 白名单（这些 WebArea 不算"当前聊天客户"）
+    _FUNCTION_PANEL_DESCS = {
+        "经营大厅", "快捷回复", "人工客服", "快速会议",
+        "筛选", "批量处理", "搜索",
+    }
+
+    def _active_chat_sender(self, window) -> str:
+        """返回当前活跃聊天面板的客户名（从 AXWebArea AXDescription 读）。
+
+        企微 Mac：聊天面板的 AXWebArea desc 即为客户名（如 '邢晓红'）。
+        若窗口里有多个 WebArea（含功能浮层），跳过功能浮层 desc 后取第一个。
+        若 panel 还在加载或不存在，返回 ''。
+        """
+        try:
+            webs = _deep_find_all(window, "AXWebArea", max_depth=15)
+        except Exception:
+            return ""
+        for w in webs:
+            try:
+                desc = str(getattr(w, "AXDescription", "") or "").strip()
+            except Exception:
+                continue
+            if not desc or desc in self._FUNCTION_PANEL_DESCS:
+                continue
+            return desc
+        return ""
+
+    def _switch_to_conv_and_verify(
+        self, conv_row, expected_sender: str = "",
+        per_attempt_timeout: float = 3.0, attempts: int = 2,
+    ) -> bool:
+        """点击会话行 → 轮询 panel desc 直到匹配 expected_sender。
+
+        - expected_sender 含括号/性别/ID（如 '邢晓红(女)-7658'），
+          匹配时只取首个 '(' 之前的主体（'邢晓红'），与 panel desc 双向 contains。
+        - 单次尝试最多 per_attempt_timeout 秒；不匹配会再点一次重试。
+        - expected_sender 为空时不做校验，仅 press + 等 1.0s（向后兼容）。
+        - 全部失败返回 False，调用方应放弃发送/读取，避免打到错误聊天。
+        """
+        sender_core = expected_sender.split("(")[0].strip() if expected_sender else ""
+
+        for attempt in range(attempts):
+            if not _press_conv_row(conv_row):
+                logger.error("[%s] _press_conv_row 全部策略失败", expected_sender or "?")
+                if attempt + 1 >= attempts:
+                    return False
+                time.sleep(0.5)
+                continue
+
+            if not sender_core:
+                time.sleep(1.0)
+                return True
+
+            deadline = time.monotonic() + per_attempt_timeout
+            seen: set[str] = set()
+            while time.monotonic() < deadline:
+                try:
+                    window = self._get_main_window()
+                except Exception:
+                    time.sleep(0.2)
+                    continue
+                cur = self._active_chat_sender(window)
+                if cur:
+                    seen.add(cur)
+                    if cur == sender_core or sender_core in cur or cur in sender_core:
+                        logger.info(
+                            "切换到 [%s] 成功（panel desc=%r，第 %d 次）",
+                            expected_sender, cur, attempt + 1,
+                        )
+                        return True
+                time.sleep(0.2)
+
+            logger.warning(
+                "切换到 [%s] 失败：%.1fs 内 panel desc 未匹配（core=%r seen=%s），第 %d/%d 次",
+                expected_sender, per_attempt_timeout, sender_core,
+                sorted(seen)[:5], attempt + 1, attempts,
+            )
+
+        logger.error(
+            "[%s] 多次切换会话仍未让 panel 与目标 sender 一致，放弃此次操作",
+            expected_sender,
+        )
+        return False
+
+    # ------------------------------------------------------------------
     # Unread conversation detection
     # ------------------------------------------------------------------
 
@@ -172,7 +290,7 @@ class WeChatWatcher:
     # Message extraction
     # ------------------------------------------------------------------
 
-    def read_last_messages(self, conv_row, count: int) -> list[str]:
+    def read_last_messages(self, conv_row, count: int, expected_sender: str = "") -> list[str]:
         """
         点击会话（静默），从右侧聊天面板读最近 count 条消息文本。
         最多重试 3 次，每次间隔 0.3 秒。失败返回 []。
@@ -181,7 +299,7 @@ class WeChatWatcher:
             return []
 
         for attempt in range(3):
-            result = self._try_read_last_messages(conv_row, count)
+            result = self._try_read_last_messages(conv_row, count, expected_sender)
             if result:
                 return result
             if attempt < 2:
@@ -211,10 +329,9 @@ class WeChatWatcher:
         # 取高度最大的（聊天区 ~1013px，输入框 ~179px）
         return max(candidates, key=lambda s: (getattr(s, "AXSize", None) or [0, 0])[1])
 
-    def _try_read_last_messages(self, conv_row, count: int) -> list[str]:
-        if not _press_conv_row(conv_row):
+    def _try_read_last_messages(self, conv_row, count: int, expected_sender: str = "") -> list[str]:
+        if not self._switch_to_conv_and_verify(conv_row, expected_sender):
             return []
-        time.sleep(0.6)  # 等聊天面板切换完成
 
         try:
             window = self._get_main_window()
@@ -357,11 +474,14 @@ class WeChatWatcher:
     # Reply sending
     # ------------------------------------------------------------------
 
-    def send_reply(self, reply_text: str, conv_row=None) -> tuple[bool, str]:
+    def send_reply(
+        self, reply_text: str, conv_row=None, expected_sender: str = "",
+    ) -> tuple[bool, str]:
         """
         将回复文本写入输入框并发送（全程后台运行，不激活窗口）。
 
-        发送前会通过 AX 选中目标会话行以切换到该会话，不抢占窗口焦点。
+        发送前必须切换到目标会话，并通过 AXWebArea desc 校验 panel 与
+        expected_sender 一致；不一致则放弃发送，避免把回复打到错误聊天。
         """
         try:
             self._get_app()
@@ -371,10 +491,13 @@ class WeChatWatcher:
             return False, ""
 
         if conv_row is not None:
-            if not _press_conv_row(conv_row):
-                logger.error("切换到目标会话失败（所有 Press 策略都不可用）")
+            if not self._switch_to_conv_and_verify(conv_row, expected_sender):
+                logger.error(
+                    "[%s] 切换会话或 panel 校验失败，放弃发送（不会误发到其他聊天）",
+                    expected_sender or "?",
+                )
                 return False, ""
-            time.sleep(1.0)  # 等 Chromium 完成聊天面板渲染（0.3s 不够）
+            # _switch_to_conv_and_verify 内部已 poll 等切换完成，无需额外 sleep
 
         # 找经营大厅等功能浮层的坐标范围，用于排除其内部的 text area
         FUNCTION_PANEL_DESCS = {"经营大厅", "快捷回复", "人工客服", "快速会议", "筛选", "批量处理", "搜索"}
@@ -1058,6 +1181,17 @@ class WeChatWatcher:
                 self._last_text_by_sender[sender] = msg["text"]
                 continue
 
+            # 出方向欢迎语过滤：preview 无法区分出/入方向，企微在客户经理新加好友
+            # 后会推欢迎语模板（"我已经添加了你..."、"尊敬的客户：感谢您选择南方航空..."），
+            # 这些不是客户消息，bot 不应回复。
+            if self._is_outgoing_template(msg["text"]):
+                logger.info(
+                    "跳过 [%s]：preview 是出方向模板（客户经理欢迎/系统提示）：%s",
+                    sender, msg["text"][:60],
+                )
+                self._last_text_by_sender[sender] = msg["text"]
+                continue
+
             # 读取条数：unread_n + 窗口内我方回复数 + 2 缓冲，上限 30
             unread_n = max(1, msg.get("unread_count", 1))
             now_ts = time.time()
@@ -1070,7 +1204,9 @@ class WeChatWatcher:
 
             all_msgs: list[str] = []
             if unread_n >= 2 or bot_in_window > 0:
-                all_msgs = self.read_last_messages(msg["conv_row"], read_n)
+                all_msgs = self.read_last_messages(
+                    msg["conv_row"], read_n, expected_sender=sender,
+                )
                 if not all_msgs:
                     logger.warning(
                         "[%s] AX 读聊天面板失败，回退到预览处理（仅最后一条）",
@@ -1193,7 +1329,9 @@ class WeChatWatcher:
 
             t_start = time.monotonic()
             sent, used_method = self.send_reply(
-                result["content"], conv_row=msg.get("conv_row")
+                result["content"],
+                conv_row=msg.get("conv_row"),
+                expected_sender=sender,
             )
             latency_ms = int((time.monotonic() - t_start) * 1000)
             if sent:

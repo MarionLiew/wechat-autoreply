@@ -1735,96 +1735,44 @@ class WeChatWatcher:
         return None
 
     def _paste_and_send_in_chat(self, pid) -> bool:
-        """在主窗口当前聊天的输入框 PostToPid 鼠标点击 → Cmd+V → Enter。"""
-        import Quartz
+        """在当前活跃聊天的输入框 Cmd+V 粘贴 + Enter 发送。
+
+        实现：用 osascript 切 WeCom 前台 → keystroke "v" with Cmd → Enter。
+        放弃用 atomacos 找输入框，因为在线索详情流程后 AX 树扫描容易卡死
+        （_deep_find_all 在深层节点上 hang 数十秒）；osascript 走系统级
+        AppleEvent，直接 keystroke 给前台 app 不需要找节点，最稳定。
+
+        前提：调用方必须先 _wait_chat_header_contains 确认当前聊天是目标
+        客户，否则 keystroke 会发到错误聊天。
+        """
+        import subprocess
+        script = (
+            'tell application "System Events"\n'
+            '    tell process "企业微信"\n'
+            '        set frontmost to true\n'
+            '        delay 0.5\n'
+            '        keystroke "v" using {command down}\n'
+            '        delay 0.6\n'
+            '        keystroke return\n'
+            '    end tell\n'
+            'end tell\n'
+        )
         try:
-            window = self._get_main_window()
-        except Exception:
-            return False
-
-        # 找单聊输入框：跳过会话列表的 'BOT' 标记，选 x>300 且尺寸大的 AXTextArea
-        text_areas = _deep_find_all(window, "AXTextArea", max_depth=15)
-        candidates = []
-        for ta in text_areas:
-            try:
-                val = str(getattr(ta, "AXValue", "") or "")
-                if val.replace("​", "").strip() == "BOT":
-                    continue
-                pos = getattr(ta, "AXPosition", None)
-                sz = getattr(ta, "AXSize", None)
-                if pos and sz and sz[0] > 500 and sz[1] > 50 and pos[0] > 300:
-                    candidates.append((sz[0] * sz[1], pos, sz, ta))
-            except Exception:
-                continue
-        if not candidates:
-            logger.warning("经营线索：未找到单聊输入框")
-            return False
-        # 优先选 y 最大的（输入框在底部），同时面积要够大
-        candidates.sort(key=lambda x: (x[1][1], x[0]), reverse=True)
-        _, pos, sz, input_box = candidates[0]
-
-        cx = pos[0] + sz[0] / 2
-        cy = pos[1] + sz[1] / 2
-
-        try:
-            # 1) PostToPid 鼠标点击输入框中心，让 Chromium 获得键盘焦点
-            pt = Quartz.CGPointMake(cx, cy)
-            for et in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-                ev = Quartz.CGEventCreateMouseEvent(None, et, pt, Quartz.kCGMouseButtonLeft)
-                Quartz.CGEventPostToPid(pid, ev)
-                time.sleep(0.05)
-            time.sleep(0.5)  # 等焦点稳定
-
-            # 2) Cmd+V 完整序列：Cmd down → V down(with Cmd flag) → V up → Cmd up
-            #    keycode: Cmd=55, V=9
-            #    PostToPid 不走全局 modifier state，必须显式发 Cmd 按键 + 在 V 事件
-            #    上加 flag，否则 Chromium 不识别为 Cmd+V。
-            cmd_down = Quartz.CGEventCreateKeyboardEvent(None, 55, True)
-            Quartz.CGEventPostToPid(pid, cmd_down)
-            time.sleep(0.05)
-
-            v_down = Quartz.CGEventCreateKeyboardEvent(None, 9, True)
-            Quartz.CGEventSetFlags(v_down, Quartz.kCGEventFlagMaskCommand)
-            Quartz.CGEventPostToPid(pid, v_down)
-            time.sleep(0.05)
-
-            v_up = Quartz.CGEventCreateKeyboardEvent(None, 9, False)
-            Quartz.CGEventSetFlags(v_up, Quartz.kCGEventFlagMaskCommand)
-            Quartz.CGEventPostToPid(pid, v_up)
-            time.sleep(0.05)
-
-            cmd_up = Quartz.CGEventCreateKeyboardEvent(None, 55, False)
-            Quartz.CGEventPostToPid(pid, cmd_up)
-            time.sleep(0.5)
-
-            # 3) 校验输入框已粘贴非空内容
-            try:
-                pasted = str(getattr(input_box, "AXValue", "") or "")
-                if not pasted.strip():
-                    logger.warning("经营线索：Cmd+V 后输入框仍为空，粘贴未生效")
-                    return False
-                logger.info("经营线索：话术已粘贴（前 60 字：%r）", pasted[:60])
-            except Exception:
-                pass  # AXValue 读不到也继续按 Enter 发送
-
-            # 4) Enter (keycode 36) 发送
-            for down in (True, False):
-                ev = Quartz.CGEventCreateKeyboardEvent(None, 36, down)
-                Quartz.CGEventPostToPid(pid, ev)
-                time.sleep(0.05)
-            time.sleep(0.4)
-
-            # 验证输入框已清空（消息已发送）
-            try:
-                after = str(getattr(input_box, "AXValue", "") or "")
-                if not after.strip():
-                    return True
-                logger.warning("经营线索：粘贴后输入框非空 %r，发送可能未生效", after[:60])
-            except Exception:
-                # 引用失效但很可能已发送
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=8,
+            )
+            if r.returncode == 0:
+                logger.info("经营线索：osascript Cmd+V + Enter 完成")
                 return True
+            logger.warning(
+                "经营线索：osascript 粘贴发送失败 rc=%s stderr=%s",
+                r.returncode, r.stderr.strip()[:120],
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("经营线索：osascript 粘贴发送超时")
         except Exception as exc:
-            logger.warning("经营线索：粘贴发送异常：%s", exc)
+            logger.warning("经营线索：osascript 粘贴发送异常：%s", exc)
         return False
 
     def _click_confirm_dialog(self, pid) -> None:

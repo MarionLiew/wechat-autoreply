@@ -1399,61 +1399,49 @@ class WeChatWatcher:
             traveler or "?", qiwei_nick,
         )
 
-        # 点击"线索详情>>"：优先 AXPress（后台安全），其次 PostToPid 坐标点击
+        # 点击"线索详情>>"：优先 PostToPid 鼠标（最可靠，AXPress 偶发 silent
+        # success——报告成功但实际没触发 popup），AXPress 仅作兜底。
+        lk_pos = getattr(lk, "AXPosition", None)
         clicked_link = False
-        for ax_action in ("Press", "AXPress"):
-            fn = getattr(lk, ax_action, None)
-            if callable(fn):
-                try:
-                    fn()
-                    logger.info("经营线索：%s 线索详情成功", ax_action)
-                    clicked_link = True
-                    break
-                except Exception as exc:
-                    logger.debug("经营线索：%s 线索详情失败：%s", ax_action, exc)
-
-        if not clicked_link:
-            lk_pos = getattr(lk, "AXPosition", None)
-            if lk_pos:
-                cx = lk_pos[0] + 36
-                cy = lk_pos[1] + 11
-                logger.info("经营线索：PostToPid 点击线索详情 (%.0f, %.0f)", cx, cy)
+        if lk_pos:
+            cx = lk_pos[0] + 36
+            cy = lk_pos[1] + 11
+            try:
                 pt = Quartz.CGPointMake(cx, cy)
                 for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
                     ev = Quartz.CGEventCreateMouseEvent(None, etype, pt, Quartz.kCGMouseButtonLeft)
                     Quartz.CGEventPostToPid(pid, ev)
                     time.sleep(0.05)
-            else:
-                logger.warning("经营线索：无法点击线索详情链接")
-                return
+                logger.info("经营线索：PostToPid 点击线索详情 (%.0f, %.0f)", cx, cy)
+                clicked_link = True
+            except Exception as exc:
+                logger.debug("经营线索：PostToPid 点击线索详情失败：%s", exc)
 
-        # 等 popup 加载完成 —— 真正的就绪标准是 popup 里出现"话术" label
-        # （仅判断 popup_win 存在不够，popup 加载中也算"存在"）。
-        # 最多等 15s，每 0.5s poll 一次。
-        time.sleep(1.0)  # 给 Chromium 起一下
-        popup_win = None
-        send_btn = None
-        ready = False
-        for attempt in range(30):
-            popup_win = self._find_lead_popup()
-            if popup_win is not None:
-                # 在 popup 里找"话术" label
-                for st in _deep_find_all(popup_win, "AXStaticText", max_depth=14):
+        if not clicked_link:
+            for ax_action in ("Press", "AXPress"):
+                fn = getattr(lk, ax_action, None)
+                if callable(fn):
                     try:
-                        v = str(getattr(st, "AXValue", "") or "").strip()
-                        if v == "话术":
-                            ready = True
-                            break
-                    except Exception:
-                        continue
-                if ready:
-                    break
-            time.sleep(0.5)
+                        fn()
+                        logger.info("经营线索：%s 线索详情成功（兜底）", ax_action)
+                        clicked_link = True
+                        break
+                    except Exception as exc:
+                        logger.debug("经营线索：%s 线索详情失败：%s", ax_action, exc)
 
-        if popup_win is None or not ready:
+        if not clicked_link:
+            logger.warning("经营线索：无法点击线索详情链接")
+            return
+
+        # 等 popup 加载完成。就绪 = 存在某个非主窗口含 "话术" label。
+        # 遍历 *所有* 非主窗口（不绑定单一 popup_win），避免被 stale popup 拐跑。
+        time.sleep(1.0)  # 给 Chromium 起一下
+        popup_win = self._wait_for_signal("话术", mode="static", timeout=15.0)
+
+        if popup_win is None:
             logger.warning(
-                "经营线索：popup 未在 15s 内加载完整（popup_win=%s, 话术_ready=%s），放弃 hash=%s",
-                popup_win is not None, ready, lead_hash[:12],
+                "经营线索：popup 未在 15s 内出现'话术' label，放弃 hash=%s",
+                lead_hash[:12],
             )
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
@@ -1479,65 +1467,46 @@ class WeChatWatcher:
             return
         logger.info("经营线索：点击话术'去发送'")
 
-        # 2) 等"复制话术并跳转至单聊窗口"按钮出现（最多 6s）
-        time.sleep(1.5)  # popup 切换稳定
-        copy_btn = None
-        for _ in range(12):
-            copy_btn = self._find_button_in_popups("复制话术并跳转")
-            if copy_btn is not None:
-                break
-            time.sleep(0.5)
-        if copy_btn is None:
-            logger.warning("经营线索：'复制话术并跳转至单聊窗口' 按钮未出现")
+        # 2) 等 popup 切到"复制话术并跳转"状态，点击该按钮
+        time.sleep(1.0)  # popup 切换缓冲
+        if not self._click_button_with_retry(
+            "复制话术并跳转", "复制话术并跳转至单聊窗口", pid, wait_timeout=8.0,
+        ):
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
-        time.sleep(0.4)  # 让按钮 settled（Chromium binding 完成）
-        if not self._press(copy_btn, pid):
-            logger.warning("经营线索：点击'复制话术并跳转至单聊窗口'失败")
-            self._processed_leads.add(lead_hash)
-            self._close_xiansuo_popups()
-            return
-        logger.info("经营线索：点击'复制话术并跳转至单聊窗口'")
 
-        # 3) 等"确认跳转"按钮出现并点击（最多 6s）
-        time.sleep(1.0)  # 对话框弹出
-        confirm_btn = None
-        for _ in range(12):
-            confirm_btn = self._find_button_in_popups("确认跳转")
-            if confirm_btn is not None:
-                break
-            time.sleep(0.5)
-        if confirm_btn is None:
-            logger.warning("经营线索：'确认跳转' 对话框未出现")
+        # 3) 等"确认跳转"对话框，点击
+        time.sleep(0.8)
+        if not self._click_button_with_retry(
+            "确认跳转", "确认跳转", pid, wait_timeout=6.0,
+        ):
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
-        time.sleep(0.4)
-        if not self._press(confirm_btn, pid):
-            logger.warning("经营线索：点击'确认跳转'失败")
-            self._processed_leads.add(lead_hash)
-            self._close_xiansuo_popups()
-            return
-        logger.info("经营线索：点击'确认跳转'，等单聊页加载...")
 
-        # 4) 等 WeCom 切到客户单聊（话术已复制到剪贴板）
-        time.sleep(2.5)
+        # 4) 等 WeCom 切到客户单聊页（chat header 必须出现旅客名才能粘贴）
+        if not self._wait_chat_header_contains(traveler, timeout=8.0):
+            logger.warning(
+                "经营线索：8s 内未切到 %r 的单聊页，**放弃粘贴发送**（避免误发其他聊天），hash=%s",
+                traveler, lead_hash[:12],
+            )
+            self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
+            return
 
         # 5) Cmd+V 粘贴 + Enter 发送
         if self._paste_and_send_in_chat(pid):
             logger.info(
-                "经营线索：✅ 全流程完成（线索 hash=%s），话术已发送",
-                lead_hash[:12],
+                "经营线索：✅ 全流程完成 旅客=%s hash=%s 话术已发送",
+                traveler, lead_hash[:12],
             )
         else:
             logger.warning(
-                "经营线索：粘贴/发送话术失败（hash=%s）",
-                lead_hash[:12],
+                "经营线索：粘贴/发送话术失败 hash=%s", lead_hash[:12],
             )
 
         self._processed_leads.add(lead_hash)
-        # 清理残留弹窗
         time.sleep(0.5)
         self._close_xiansuo_popups()
 
@@ -1586,6 +1555,54 @@ class WeChatWatcher:
                 pass
         return False
 
+    def _click_button_with_retry(
+        self, title_substring: str, label: str, pid: int,
+        wait_timeout: float = 8.0,
+    ) -> bool:
+        """等找到 title 含 substring 的 AXButton，settled 0.4s 后 fresh re-find 再 press。
+
+        re-find 是关键——find 到 press 之间 popup 可能重渲染，旧引用 stale，
+        重新找一次拿最新引用再 press。
+        """
+        deadline = time.monotonic() + wait_timeout
+        btn = None
+        while time.monotonic() < deadline:
+            btn = self._find_button_in_popups(title_substring)
+            if btn is not None:
+                break
+            time.sleep(0.5)
+        if btn is None:
+            logger.warning("经营线索：'%s' 按钮未在 %.1fs 内出现", label, wait_timeout)
+            return False
+        time.sleep(0.4)
+        # 关键：fresh re-find，避免 AXUIElement 引用 stale
+        btn_fresh = self._find_button_in_popups(title_substring) or btn
+        if not self._press(btn_fresh, pid):
+            logger.warning("经营线索：点击'%s'失败", label)
+            return False
+        logger.info("经营线索：点击'%s'", label)
+        return True
+
+    def _wait_chat_header_contains(self, traveler_core: str, timeout: float = 6.0) -> bool:
+        """等主窗口 chat header 显示 traveler 名（用 _active_chat_sender 兜底逻辑）。"""
+        if not traveler_core:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                window = self._get_main_window()
+                sender = self._active_chat_sender(window)
+                if sender and traveler_core in sender:
+                    logger.info(
+                        "经营线索：单聊页已就绪（chat header=%r 包含旅客=%r）",
+                        sender, traveler_core,
+                    )
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return False
+
     def _find_first_huashu_send_btn(self, popup):
         """popup 里找'话术' label 之下第一个 AXButton title='去发送'。"""
         huashu_y = None
@@ -1625,17 +1642,88 @@ class WeChatWatcher:
         for w in wins:
             try:
                 wt = str(getattr(w, "AXTitle", "") or "").strip()
+                sz = getattr(w, "AXSize", None)
             except Exception:
                 continue
             if wt == "企业微信":
                 continue
-            for btn in _deep_find_all(w, "AXButton", max_depth=10):
+            if not sz or sz[0] < 300:
+                continue
+            for btn in _deep_find_all(w, "AXButton", max_depth=14):
                 try:
                     t = str(getattr(btn, "AXTitle", "") or "")
                     if title_substring in t:
                         return btn
                 except Exception:
                     continue
+        return None
+
+    def _find_popup_with_signal(self, signal_label: str):
+        """在所有非主窗口里找含 signal_label（AXStaticText.AXValue == signal_label）
+        的 popup。signal_label 是"该 popup 已完成加载并进入特定状态"的标识。
+
+        例：
+        - '话术'         → 线索详情 popup 加载完成（带话术列表）
+        - '即将跳转'     → 确认跳转对话框出现
+
+        返回第一个匹配的 popup window 或 None。
+        """
+        try:
+            wins = self._get_app().AXWindows
+        except Exception:
+            return None
+        for w in wins:
+            try:
+                wt = str(getattr(w, "AXTitle", "") or "").strip()
+                sz = getattr(w, "AXSize", None)
+            except Exception:
+                continue
+            if wt == "企业微信":
+                continue
+            if not sz or sz[0] < 300:
+                continue
+            for st in _deep_find_all(w, "AXStaticText", max_depth=14):
+                try:
+                    v = str(getattr(st, "AXValue", "") or "").strip()
+                    if v == signal_label:
+                        return w
+                except Exception:
+                    continue
+        return None
+
+    def _wait_for_signal(self, signal_label: str, mode: str = "static",
+                         timeout: float = 12.0, poll_interval: float = 0.5):
+        """轮询直到找到 popup 含 signal_label 元素，返回 popup 或 None。
+
+        mode='static': 找 AXStaticText.AXValue == signal_label 的 popup
+        mode='button': 找 AXButton.AXTitle contains signal_label 的 popup
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if mode == "static":
+                w = self._find_popup_with_signal(signal_label)
+            else:
+                # button 模式：返回含目标按钮的 popup
+                btn = self._find_button_in_popups(signal_label)
+                if btn is not None:
+                    try:
+                        # 走到 popup window 这一层
+                        node = btn
+                        for _ in range(20):
+                            parent = getattr(node, "AXParent", None)
+                            if parent is None:
+                                break
+                            role = str(getattr(parent, "AXRole", "") or "")
+                            if role == "AXWindow":
+                                return parent
+                            node = parent
+                    except Exception:
+                        pass
+                    return btn  # 兜底返回按钮本身（其实没用到）
+                w = None
+            if w is not None:
+                return w
+            time.sleep(poll_interval)
         return None
 
     def _paste_and_send_in_chat(self, pid) -> bool:
@@ -1671,28 +1759,52 @@ class WeChatWatcher:
         cy = pos[1] + sz[1] / 2
 
         try:
-            # PostToPid 鼠标点击输入框获取焦点
+            # 1) PostToPid 鼠标点击输入框中心，让 Chromium 获得键盘焦点
             pt = Quartz.CGPointMake(cx, cy)
             for et in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
                 ev = Quartz.CGEventCreateMouseEvent(None, et, pt, Quartz.kCGMouseButtonLeft)
                 Quartz.CGEventPostToPid(pid, ev)
                 time.sleep(0.05)
-            time.sleep(0.4)
+            time.sleep(0.5)  # 等焦点稳定
 
-            # Cmd+V (V = keycode 9)
-            for down in (True, False):
-                ev = Quartz.CGEventCreateKeyboardEvent(None, 9, down)
-                Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
-                Quartz.CGEventPostToPid(pid, ev)
-                time.sleep(0.05)
-            time.sleep(0.4)
+            # 2) Cmd+V 完整序列：Cmd down → V down(with Cmd flag) → V up → Cmd up
+            #    keycode: Cmd=55, V=9
+            #    PostToPid 不走全局 modifier state，必须显式发 Cmd 按键 + 在 V 事件
+            #    上加 flag，否则 Chromium 不识别为 Cmd+V。
+            cmd_down = Quartz.CGEventCreateKeyboardEvent(None, 55, True)
+            Quartz.CGEventPostToPid(pid, cmd_down)
+            time.sleep(0.05)
 
-            # Enter (keycode 36) 发送
+            v_down = Quartz.CGEventCreateKeyboardEvent(None, 9, True)
+            Quartz.CGEventSetFlags(v_down, Quartz.kCGEventFlagMaskCommand)
+            Quartz.CGEventPostToPid(pid, v_down)
+            time.sleep(0.05)
+
+            v_up = Quartz.CGEventCreateKeyboardEvent(None, 9, False)
+            Quartz.CGEventSetFlags(v_up, Quartz.kCGEventFlagMaskCommand)
+            Quartz.CGEventPostToPid(pid, v_up)
+            time.sleep(0.05)
+
+            cmd_up = Quartz.CGEventCreateKeyboardEvent(None, 55, False)
+            Quartz.CGEventPostToPid(pid, cmd_up)
+            time.sleep(0.5)
+
+            # 3) 校验输入框已粘贴非空内容
+            try:
+                pasted = str(getattr(input_box, "AXValue", "") or "")
+                if not pasted.strip():
+                    logger.warning("经营线索：Cmd+V 后输入框仍为空，粘贴未生效")
+                    return False
+                logger.info("经营线索：话术已粘贴（前 60 字：%r）", pasted[:60])
+            except Exception:
+                pass  # AXValue 读不到也继续按 Enter 发送
+
+            # 4) Enter (keycode 36) 发送
             for down in (True, False):
                 ev = Quartz.CGEventCreateKeyboardEvent(None, 36, down)
                 Quartz.CGEventPostToPid(pid, ev)
                 time.sleep(0.05)
-            time.sleep(0.3)
+            time.sleep(0.4)
 
             # 验证输入框已清空（消息已发送）
             try:

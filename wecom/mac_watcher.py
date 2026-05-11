@@ -1451,45 +1451,49 @@ class WeChatWatcher:
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
-        if not self._press(send_btn):
+        if not self._press(send_btn, pid):
             logger.warning("经营线索：点击话术'去发送'失败")
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
         logger.info("经营线索：点击话术'去发送'")
 
-        # 2) 等"复制话术并跳转至单聊窗口"按钮出现（最多 5s）
+        # 2) 等"复制话术并跳转至单聊窗口"按钮出现（最多 6s）
+        time.sleep(1.5)  # popup 切换稳定
         copy_btn = None
-        for _ in range(10):
-            time.sleep(0.5)
+        for _ in range(12):
             copy_btn = self._find_button_in_popups("复制话术并跳转")
             if copy_btn is not None:
                 break
+            time.sleep(0.5)
         if copy_btn is None:
             logger.warning("经营线索：'复制话术并跳转至单聊窗口' 按钮未出现")
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
-        if not self._press(copy_btn):
+        time.sleep(0.4)  # 让按钮 settled（Chromium binding 完成）
+        if not self._press(copy_btn, pid):
             logger.warning("经营线索：点击'复制话术并跳转至单聊窗口'失败")
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
         logger.info("经营线索：点击'复制话术并跳转至单聊窗口'")
 
-        # 3) 等"确认跳转"按钮出现并点击（最多 5s）
+        # 3) 等"确认跳转"按钮出现并点击（最多 6s）
+        time.sleep(1.0)  # 对话框弹出
         confirm_btn = None
-        for _ in range(10):
-            time.sleep(0.5)
+        for _ in range(12):
             confirm_btn = self._find_button_in_popups("确认跳转")
             if confirm_btn is not None:
                 break
+            time.sleep(0.5)
         if confirm_btn is None:
             logger.warning("经营线索：'确认跳转' 对话框未出现")
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
-        if not self._press(confirm_btn):
+        time.sleep(0.4)
+        if not self._press(confirm_btn, pid):
             logger.warning("经营线索：点击'确认跳转'失败")
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
@@ -1521,8 +1525,21 @@ class WeChatWatcher:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _press(node) -> bool:
-        """AXPress / Press 任一成功即返回 True。"""
+    def _press(node, pid: int | None = None) -> bool:
+        """点击 AX 节点：优先 AXPress / Press；失败用 PostToPid 鼠标坐标点击中心兜底。
+
+        实测 popup 里 AXPress 在 daemon 上下文偶发失败（Chromium 内嵌按钮在
+        popup 重渲染时引用 stale），用真实鼠标事件兜底能突破。
+        """
+        # 提前读取坐标，避免 node 后续失效
+        pos = None
+        sz = None
+        try:
+            pos = getattr(node, "AXPosition", None)
+            sz = getattr(node, "AXSize", None)
+        except Exception:
+            pass
+
         for action in ("Press", "AXPress"):
             fn = getattr(node, action, None)
             if callable(fn):
@@ -1531,6 +1548,21 @@ class WeChatWatcher:
                     return True
                 except Exception:
                     continue
+
+        # PostToPid 鼠标坐标点击 fallback
+        if pid and pos and sz:
+            try:
+                import Quartz
+                cx = pos[0] + sz[0] / 2
+                cy = pos[1] + sz[1] / 2
+                pt = Quartz.CGPointMake(cx, cy)
+                for et in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                    ev = Quartz.CGEventCreateMouseEvent(None, et, pt, Quartz.kCGMouseButtonLeft)
+                    Quartz.CGEventPostToPid(pid, ev)
+                    time.sleep(0.05)
+                return True
+            except Exception:
+                pass
         return False
 
     def _find_first_huashu_send_btn(self, popup):

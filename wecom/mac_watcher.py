@@ -1202,7 +1202,7 @@ class WeChatWatcher:
         """
         import Quartz
         expand_sts = []
-        for st in _deep_find_all(popup, "AXStaticText", max_depth=12):
+        for st in _deep_find_all(popup, "AXStaticText", max_depth=8):
             try:
                 v = str(getattr(st, "AXValue", "") or "").strip()
                 if v != "点击展开":
@@ -1240,7 +1240,7 @@ class WeChatWatcher:
         作为研究素材；同时尝试基于"添加企微"关键词附近找答案。
         """
         all_st = []
-        for st in _deep_find_all(popup, "AXStaticText", max_depth=12):
+        for st in _deep_find_all(popup, "AXStaticText", max_depth=8):
             try:
                 v = str(getattr(st, "AXValue", "") or "").strip()
                 pos = getattr(st, "AXPosition", None)
@@ -1580,7 +1580,7 @@ class WeChatWatcher:
 
     def _click_button_with_retry(
         self, title_substring: str, label: str, pid: int,
-        wait_timeout: float = 8.0,
+        wait_timeout: float = 12.0,
     ) -> bool:
         """等找到 title 含 substring 的 AXButton，settled 0.4s 后 fresh re-find 再 press。
 
@@ -1596,6 +1596,7 @@ class WeChatWatcher:
             time.sleep(0.5)
         if btn is None:
             logger.warning("经营线索：'%s' 按钮未在 %.1fs 内出现", label, wait_timeout)
+            self._dump_current_popups(f"没找到'{label}'按钮 诊断")
             return False
         time.sleep(0.4)
         # 关键：fresh re-find，避免 AXUIElement 引用 stale
@@ -1665,7 +1666,7 @@ class WeChatWatcher:
     def _find_first_huashu_send_btn(self, popup):
         """popup 里找'话术' label 之下第一个 AXButton title='去发送'。"""
         huashu_y = None
-        for st in _deep_find_all(popup, "AXStaticText", max_depth=14):
+        for st in _deep_find_all(popup, "AXStaticText", max_depth=8):
             try:
                 v = str(getattr(st, "AXValue", "") or "").strip()
                 if v == "话术":
@@ -1678,7 +1679,7 @@ class WeChatWatcher:
         if huashu_y is None:
             return None
         candidates = []
-        for btn in _deep_find_all(popup, "AXButton", max_depth=14):
+        for btn in _deep_find_all(popup, "AXButton", max_depth=8):
             try:
                 t = str(getattr(btn, "AXTitle", "") or "").strip()
                 if t == "去发送":
@@ -1708,7 +1709,7 @@ class WeChatWatcher:
                 continue
             if not sz or sz[0] < 300:
                 continue
-            for btn in _deep_find_all(w, "AXButton", max_depth=14):
+            for btn in _deep_find_all(w, "AXButton", max_depth=8):
                 try:
                     t = str(getattr(btn, "AXTitle", "") or "")
                     if title_substring in t:

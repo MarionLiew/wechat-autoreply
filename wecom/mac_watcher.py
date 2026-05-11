@@ -1453,13 +1453,15 @@ class WeChatWatcher:
             return
 
         # 等 popup 加载完成。就绪 = 存在某个非主窗口含 "话术" label。
-        # 遍历 *所有* 非主窗口（不绑定单一 popup_win），避免被 stale popup 拐跑。
-        time.sleep(1.0)  # 给 Chromium 起一下
-        popup_win = self._wait_for_signal("话术", mode="static", timeout=15.0)
+        # 给 Chromium 起一下 + 长 timeout（话术区在 popup 底部，渲染慢）。
+        time.sleep(2.0)
+        popup_win = self._wait_for_signal(
+            "话术", mode="static", timeout=20.0, poll_interval=1.0,
+        )
 
         if popup_win is None:
             logger.warning(
-                "经营线索：popup 未在 15s 内出现'话术' label，放弃 hash=%s",
+                "经营线索：popup 未在 20s 内出现'话术' label，放弃 hash=%s",
                 lead_hash[:12],
             )
             self._processed_leads.add(lead_hash)
@@ -1681,11 +1683,7 @@ class WeChatWatcher:
         """在所有非主窗口里找含 signal_label（AXStaticText.AXValue == signal_label）
         的 popup。signal_label 是"该 popup 已完成加载并进入特定状态"的标识。
 
-        例：
-        - '话术'         → 线索详情 popup 加载完成（带话术列表）
-        - '即将跳转'     → 确认跳转对话框出现
-
-        返回第一个匹配的 popup window 或 None。
+        depth=14 实测在 popup 重渲染场景下慢，降到 8（popup 内文字 label 通常浅）。
         """
         try:
             wins = self._get_app().AXWindows
@@ -1701,7 +1699,7 @@ class WeChatWatcher:
                 continue
             if not sz or sz[0] < 300:
                 continue
-            for st in _deep_find_all(w, "AXStaticText", max_depth=14):
+            for st in _deep_find_all(w, "AXStaticText", max_depth=8):
                 try:
                     v = str(getattr(st, "AXValue", "") or "").strip()
                     if v == signal_label:

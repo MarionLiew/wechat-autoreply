@@ -160,9 +160,10 @@ class WeChatWatcher:
 
         都拿不到返回 ''。
         """
-        # 策略 A：AXWebArea desc
+        # 策略 A：AXWebArea desc（浅扫，max_depth=6）
+        # 之前 depth=15 在大窗口下要 8s+；改浅扫避免阻塞。WebArea 通常浅层。
         try:
-            webs = _deep_find_all(window, "AXWebArea", max_depth=15)
+            webs = _deep_find_all(window, "AXWebArea", max_depth=6)
         except Exception:
             webs = []
         for w in webs:
@@ -174,30 +175,40 @@ class WeChatWatcher:
                 continue
             return desc
 
-        # 策略 B：chat header 上的 AXStaticText
-        # chat header 是 chat 区域顶部的客户名标签，位置：x 400-1100, y 200-320
-        # 通常格式为 '<名>(<性别>)-<id>'（如 '刘明瑞(男)-3647'），有时是公众号名等
+        # 策略 B：chat header StaticText
+        # WeCom 主窗口结构稳定：AXWindow → AXSplitGroup → AXSplitGroup → 直接
+        # 子节点里有 chat header 的 StaticText（位置 y=50 附近 page title 或
+        # y=266 附近 chat banner 内 customer 全称）。
+        # 不用 deep_find_all 全树扫（实测 673 个 StaticText × depth=5 也要 9s+），
+        # 而是只扫 inner split group 的直接子节点，~10 个节点，<0.1s。
+        candidates = []
         try:
-            sts = _deep_find_all(window, "AXStaticText", max_depth=8)
+            for c in window.AXChildren or []:
+                if str(getattr(c, "AXRole", "") or "") != "AXSplitGroup":
+                    continue
+                for cc in c.AXChildren or []:
+                    if str(getattr(cc, "AXRole", "") or "") != "AXSplitGroup":
+                        continue
+                    # cc = inner split group，扫直接子节点
+                    for el in cc.AXChildren or []:
+                        try:
+                            if str(getattr(el, "AXRole", "") or "") != "AXStaticText":
+                                continue
+                            pos = getattr(el, "AXPosition", None)
+                            val = str(getattr(el, "AXValue", "") or "").strip()
+                            if not pos or not val:
+                                continue
+                            candidates.append((pos[1], pos[0], val))
+                        except Exception:
+                            continue
         except Exception:
-            return ""
-        for st in sts:
-            try:
-                pos = getattr(st, "AXPosition", None)
-                if not pos:
-                    continue
-                x, y = pos[0], pos[1]
-                if not (400 <= x <= 1100 and 200 <= y <= 320):
-                    continue
-                val = str(getattr(st, "AXValue", "") or "").strip()
-                if not val:
-                    continue
-                # 排除已知噪声标签
-                if val in ("@微信", "经营线索", "客户联系") or val.startswith(("4月", "5月", "6月")):
-                    continue
-                return val
-            except Exception:
+            pass
+        # 取 y 最小的（顶部 chat header），并排除噪声
+        candidates.sort()
+        for y, x, val in candidates:
+            if val in ("@微信", "经营线索", "客户联系") or val.startswith(("4月", "5月", "6月")):
                 continue
+            return val
         return ""
 
     def _try_dismiss_covering_panel(self, window) -> bool:

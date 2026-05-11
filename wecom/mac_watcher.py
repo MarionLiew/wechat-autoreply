@@ -1378,6 +1378,22 @@ class WeChatWatcher:
             logger.info("经营线索：最新线索已处理过，跳过")
             return
 
+        # 根据消息文本里"微信昵称:"字段判断是否已添加企微：
+        # - 已添加：'微信昵称:某某'  → 走开 popup + 点 去联系
+        # - 未添加：'微信昵称:\n'    → 直接跳过，省 ~13s popup 耗时
+        traveler, qiwei_nick = _parse_lead_message(parent_val)
+        if qiwei_nick == "":
+            self._processed_leads.add(lead_hash)
+            logger.info(
+                "经营线索：客户【未添加企微】✗（旅客=%s, 微信昵称为空），跳过",
+                traveler or "?",
+            )
+            return
+        logger.info(
+            "经营线索：客户【已添加企微】✓（旅客=%s, 微信昵称=%s）",
+            traveler or "?", qiwei_nick,
+        )
+
         # 点击"线索详情>>"：优先 AXPress（后台安全），其次 PostToPid 坐标点击
         clicked_link = False
         for ax_action in ("Press", "AXPress"):
@@ -2000,6 +2016,38 @@ def _read_chat_from_table(window, count: int) -> list[str]:
 
     logger.debug("_read_chat_from_table: 所有 AXTable 均无有效消息")
     return []
+
+
+def _parse_lead_message(text: str) -> tuple[str, str | None]:
+    """解析经营线索消息文本，返回 (旅客名, 微信昵称)。
+
+    消息格式（示例）：
+        【出行提醒】
+        旅客:郝祥宇
+        微信昵称:
+        航程信息:深圳宝安机场-武汉天河机场
+
+        线索详情>>
+
+    返回：
+        traveler: 旅客名（如 '郝祥宇'），找不到返回 ''
+        qiwei_nick: 微信昵称的值——非空字符串 = 已添加企微；
+                    空字符串 ''       = 字段存在但值为空（未添加企微）；
+                    None             = 字段不存在（格式异常）
+    """
+    if not text:
+        return "", None
+    traveler = ""
+    qiwei: str | None = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("旅客:") or s.startswith("旅客："):
+            traveler = s.split(":", 1)[1] if ":" in s else s.split("：", 1)[1]
+            traveler = traveler.strip()
+        elif s.startswith("微信昵称:") or s.startswith("微信昵称："):
+            v = s.split(":", 1)[1] if ":" in s else s.split("：", 1)[1]
+            qiwei = v.strip()
+    return traveler, qiwei
 
 
 def _force_click_conv_row(row, pid) -> bool:

@@ -1399,38 +1399,46 @@ class WeChatWatcher:
             traveler or "?", qiwei_nick,
         )
 
-        # 点击"线索详情>>"：优先 PostToPid 鼠标（最可靠，AXPress 偶发 silent
-        # success——报告成功但实际没触发 popup），AXPress 仅作兜底。
+        # 点击"线索详情>>"：双管齐下——先 AXPress 触发 webview 内部 click
+        # （Chromium 链接对 AXPress 最敏感），再 PostToPid 鼠标点 link 真实
+        # 中心兜底。两个都试，无论哪个生效都行。
         lk_pos = getattr(lk, "AXPosition", None)
-        clicked_link = False
-        if lk_pos:
-            cx = lk_pos[0] + 36
-            cy = lk_pos[1] + 11
+        lk_sz = getattr(lk, "AXSize", None)
+
+        # AXPress 尝试
+        ax_pressed = False
+        for ax_action in ("Press", "AXPress"):
+            fn = getattr(lk, ax_action, None)
+            if callable(fn):
+                try:
+                    fn()
+                    ax_pressed = True
+                    logger.info("经营线索：AXPress 线索详情")
+                    break
+                except Exception as exc:
+                    logger.debug("经营线索：%s 线索详情失败：%s", ax_action, exc)
+
+        # PostToPid 鼠标点 link 中心
+        mouse_clicked = False
+        if lk_pos and lk_sz:
             try:
+                cx = lk_pos[0] + lk_sz[0] / 2
+                cy = lk_pos[1] + lk_sz[1] / 2
                 pt = Quartz.CGPointMake(cx, cy)
                 for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
                     ev = Quartz.CGEventCreateMouseEvent(None, etype, pt, Quartz.kCGMouseButtonLeft)
                     Quartz.CGEventPostToPid(pid, ev)
                     time.sleep(0.05)
-                logger.info("经营线索：PostToPid 点击线索详情 (%.0f, %.0f)", cx, cy)
-                clicked_link = True
+                mouse_clicked = True
+                logger.info(
+                    "经营线索：PostToPid 鼠标点击线索详情 中心=(%.0f, %.0f) sz=%s",
+                    cx, cy, lk_sz,
+                )
             except Exception as exc:
-                logger.debug("经营线索：PostToPid 点击线索详情失败：%s", exc)
+                logger.debug("经营线索：PostToPid 点击线索详情异常：%s", exc)
 
-        if not clicked_link:
-            for ax_action in ("Press", "AXPress"):
-                fn = getattr(lk, ax_action, None)
-                if callable(fn):
-                    try:
-                        fn()
-                        logger.info("经营线索：%s 线索详情成功（兜底）", ax_action)
-                        clicked_link = True
-                        break
-                    except Exception as exc:
-                        logger.debug("经营线索：%s 线索详情失败：%s", ax_action, exc)
-
-        if not clicked_link:
-            logger.warning("经营线索：无法点击线索详情链接")
+        if not (ax_pressed or mouse_clicked):
+            logger.warning("经营线索：无法点击线索详情链接（AXPress 和 鼠标都失败）")
             return
 
         # 等 popup 加载完成。就绪 = 存在某个非主窗口含 "话术" label。

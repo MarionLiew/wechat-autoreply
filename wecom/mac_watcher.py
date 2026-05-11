@@ -1138,11 +1138,18 @@ class WeChatWatcher:
         return links
 
     def _find_lead_popup(self):
-        """找当前打开的线索详情 popup 窗口（标题为空 + 尺寸合理 + 含'经营线索详情'）。"""
+        """找当前打开的线索 popup 窗口。
+
+        优先匹配"经营线索详情"（已添加企微的标准 popup）；其次回退到任意
+        尺寸合理的非主窗口（未添加企微的精简 popup 标题/结构不同，但也是
+        非主窗口的 AXWindow）。
+        """
         try:
             wins = self._get_app().AXWindows
         except Exception:
             return None
+
+        candidates = []
         for w in wins:
             try:
                 title = str(getattr(w, "AXTitle", "") or "").strip()
@@ -1153,7 +1160,9 @@ class WeChatWatcher:
                 continue
             if not sz or sz[0] < 300 or sz[1] < 300:
                 continue
-            # 浅扫看是否含 '经营线索详情' 标识，避免误抓其他独立窗口
+            candidates.append((sz, w))
+
+            # 优先匹配 '经营线索详情' 标题
             for st in _deep_find_all(w, "AXStaticText", max_depth=8):
                 try:
                     v = str(getattr(st, "AXValue", "") or "").strip()
@@ -1161,6 +1170,15 @@ class WeChatWatcher:
                     continue
                 if v == "经营线索详情":
                     return w
+
+        # 回退：用最大尺寸的非主窗口（兼容未添加企微的简化 popup）
+        if candidates:
+            candidates.sort(key=lambda x: x[0][0] * x[0][1], reverse=True)
+            logger.info(
+                "经营线索：未匹配到 '经营线索详情' popup，回退用最大非主窗口 sz=%s",
+                candidates[0][0],
+            )
+            return candidates[0][1]
         return None
 
     def _expand_member_info_section(self, popup, pid) -> bool:
@@ -1226,8 +1244,14 @@ class WeChatWatcher:
         for y, x, v in all_st[:30]:
             logger.info("  y=%.0f x=%.0f %r", y, x, v)
 
-        # 尝试解析"添加企微"状态：找含'添加企微'的 label，
-        # 看其右侧或下方相邻 StaticText 是 '是' / '否' / '已添加' / '未添加'
+        # 策略 1：完整句子里直接含"未添加企微"/"已添加企微"等
+        for y, x, v in all_st:
+            if "未添加企微" in v or "客户未添加" in v or "尚未添加" in v:
+                return "未添加"
+            if "已添加企微" in v:
+                return "已添加"
+
+        # 策略 2：label + 值 结构（"是否添加企微" → "是"/"否"）
         for i, (y, x, v) in enumerate(all_st):
             if "添加企微" not in v and "微信" not in v:
                 continue

@@ -1343,6 +1343,11 @@ class WeChatWatcher:
             return
         time.sleep(0.8)
 
+        # 先关闭可能存在的残留 popup（上一轮失败留下的"复制话术..."等弹窗），
+        # 否则 WeCom 可能把它误当成"已打开"，不真正渲染新的线索详情 popup。
+        self._close_xiansuo_popups()
+        time.sleep(0.5)
+
         try:
             window = self._get_main_window()
         except Exception as exc:
@@ -1422,22 +1427,38 @@ class WeChatWatcher:
                 logger.warning("经营线索：无法点击线索详情链接")
                 return
 
-        # 等 popup 加载完成（最多 5s）
-        time.sleep(0.5)
+        # 等 popup 加载完成 —— 真正的就绪标准是 popup 里出现"话术" label
+        # （仅判断 popup_win 存在不够，popup 加载中也算"存在"）。
+        # 最多等 15s，每 0.5s poll 一次。
+        time.sleep(1.0)  # 给 Chromium 起一下
         popup_win = None
-        for _ in range(10):
+        send_btn = None
+        ready = False
+        for attempt in range(30):
             popup_win = self._find_lead_popup()
             if popup_win is not None:
-                break
+                # 在 popup 里找"话术" label
+                for st in _deep_find_all(popup_win, "AXStaticText", max_depth=14):
+                    try:
+                        v = str(getattr(st, "AXValue", "") or "").strip()
+                        if v == "话术":
+                            ready = True
+                            break
+                    except Exception:
+                        continue
+                if ready:
+                    break
             time.sleep(0.5)
 
-        if popup_win is None:
-            logger.warning("经营线索：popup 未出现，放弃")
+        if popup_win is None or not ready:
+            logger.warning(
+                "经营线索：popup 未在 15s 内加载完整（popup_win=%s, 话术_ready=%s），放弃 hash=%s",
+                popup_win is not None, ready, lead_hash[:12],
+            )
             self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
             return
-
-        # 等话术栏渲染（话术区在 popup 底部，需要等较长时间）
-        time.sleep(2.0)
+        logger.info("经营线索：popup 已加载完成（'话术' label 已出现）")
 
         # === 新流程：话术 → 去发送 → 复制话术并跳转 → 确认跳转 → 粘贴发送 ===
 
@@ -1445,7 +1466,7 @@ class WeChatWatcher:
         send_btn = self._find_first_huashu_send_btn(popup_win)
         if send_btn is None:
             logger.warning(
-                "经营线索：popup 里未找到'话术'下的去发送按钮，hash=%s",
+                "经营线索：popup 有'话术' label 但未找到下方'去发送'按钮，hash=%s",
                 lead_hash[:12],
             )
             self._processed_leads.add(lead_hash)

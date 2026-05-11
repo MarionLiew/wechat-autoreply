@@ -1422,84 +1422,237 @@ class WeChatWatcher:
                 logger.warning("经营线索：无法点击线索详情链接")
                 return
 
-        # 等 popup 加载完成（最多 5s）。仅用于让 popup 有时间初始化，不在
-        # popup 里读"添加企微"状态——实测 popup 没有该状态文字，且常常只有
-        # 1 条 StaticText（'客户经营专区' 这种标识），展开+解析没意义。
-        # 分流的实际依据是下面的"去联系按钮存不存在"。
+        # 等 popup 加载完成（最多 5s）
         time.sleep(0.5)
+        popup_win = None
         for _ in range(10):
-            if self._find_lead_popup() is not None:
+            popup_win = self._find_lead_popup()
+            if popup_win is not None:
                 break
             time.sleep(0.5)
 
-        # 轮询等待"去联系"按钮出现（最多 8s，每 1s 检查一次）
-        # 注意：客户未添加企微时，popup 里根本没有"去联系"按钮，永远等不到。
-        # 实测 popup 加载好后 ~3-4s 内"去联系"会出现；超过 8s 仍没就视为未添加。
-        qulianxi = None
-        for attempt in range(8):
-            time.sleep(1.0)
-            try:
-                window = self._get_main_window()
-            except Exception:
-                continue
-            qulianxi = self._find_qulianxi(window)
-            if qulianxi is not None:
-                logger.info(
-                    "经营线索：客户【已添加企微】✓（第 %d 次轮询找到去联系按钮）",
-                    attempt + 1,
-                )
-                break
-            logger.debug("经营线索：第 %d 次轮询未找到去联系，继续等待…", attempt + 1)
-
-        if qulianxi is None:
-            # 标记此线索已处理，避免下一轮 tick 重复打开 popup 死循环。
+        if popup_win is None:
+            logger.warning("经营线索：popup 未出现，放弃")
             self._processed_leads.add(lead_hash)
-            logger.warning(
-                "经营线索：客户【未添加企微】✗（8s 内无去联系按钮），跳过 hash=%s",
-                lead_hash[:12],
-            )
-            self._close_xiansuo_popups()
             return
 
-        # 点击"去联系"：优先 AXPress（背景安全），失败再用 PostToPid 坐标点击
-        ql_clicked = False
-        for ax_action in ("Press", "AXPress"):
-            fn = getattr(qulianxi, ax_action, None)
+        # 等话术栏渲染（话术区在 popup 底部，需要等较长时间）
+        time.sleep(2.0)
+
+        # === 新流程：话术 → 去发送 → 复制话术并跳转 → 确认跳转 → 粘贴发送 ===
+
+        # 1) 找话术区下第一个"去发送"按钮（话术 label 之下 y 最小者）
+        send_btn = self._find_first_huashu_send_btn(popup_win)
+        if send_btn is None:
+            logger.warning(
+                "经营线索：popup 里未找到'话术'下的去发送按钮，hash=%s",
+                lead_hash[:12],
+            )
+            self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
+            return
+        if not self._press(send_btn):
+            logger.warning("经营线索：点击话术'去发送'失败")
+            self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
+            return
+        logger.info("经营线索：点击话术'去发送'")
+
+        # 2) 等"复制话术并跳转至单聊窗口"按钮出现（最多 5s）
+        copy_btn = None
+        for _ in range(10):
+            time.sleep(0.5)
+            copy_btn = self._find_button_in_popups("复制话术并跳转")
+            if copy_btn is not None:
+                break
+        if copy_btn is None:
+            logger.warning("经营线索：'复制话术并跳转至单聊窗口' 按钮未出现")
+            self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
+            return
+        if not self._press(copy_btn):
+            logger.warning("经营线索：点击'复制话术并跳转至单聊窗口'失败")
+            self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
+            return
+        logger.info("经营线索：点击'复制话术并跳转至单聊窗口'")
+
+        # 3) 等"确认跳转"按钮出现并点击（最多 5s）
+        confirm_btn = None
+        for _ in range(10):
+            time.sleep(0.5)
+            confirm_btn = self._find_button_in_popups("确认跳转")
+            if confirm_btn is not None:
+                break
+        if confirm_btn is None:
+            logger.warning("经营线索：'确认跳转' 对话框未出现")
+            self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
+            return
+        if not self._press(confirm_btn):
+            logger.warning("经营线索：点击'确认跳转'失败")
+            self._processed_leads.add(lead_hash)
+            self._close_xiansuo_popups()
+            return
+        logger.info("经营线索：点击'确认跳转'，等单聊页加载...")
+
+        # 4) 等 WeCom 切到客户单聊（话术已复制到剪贴板）
+        time.sleep(2.5)
+
+        # 5) Cmd+V 粘贴 + Enter 发送
+        if self._paste_and_send_in_chat(pid):
+            logger.info(
+                "经营线索：✅ 全流程完成（线索 hash=%s），话术已发送",
+                lead_hash[:12],
+            )
+        else:
+            logger.warning(
+                "经营线索：粘贴/发送话术失败（hash=%s）",
+                lead_hash[:12],
+            )
+
+        self._processed_leads.add(lead_hash)
+        # 清理残留弹窗
+        time.sleep(0.5)
+        self._close_xiansuo_popups()
+
+    # ------------------------------------------------------------------
+    # 话术发送流程 helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _press(node) -> bool:
+        """AXPress / Press 任一成功即返回 True。"""
+        for action in ("Press", "AXPress"):
+            fn = getattr(node, action, None)
             if callable(fn):
                 try:
                     fn()
-                    logger.info("经营线索：%s 去联系成功", ax_action)
-                    ql_clicked = True
-                    break
-                except Exception as exc:
-                    logger.debug("经营线索：%s 去联系失败：%s", ax_action, exc)
+                    return True
+                except Exception:
+                    continue
+        return False
 
-        if not ql_clicked:
-            ql_pos = getattr(qulianxi, "AXPosition", None)
-            if ql_pos:
-                cx = ql_pos[0] + 20
-                cy = ql_pos[1] + 10
-                logger.info("经营线索：PostToPid 点击去联系 (%.0f, %.0f)", cx, cy)
-                pt = Quartz.CGPointMake(cx, cy)
-                for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-                    ev = Quartz.CGEventCreateMouseEvent(None, etype, pt, Quartz.kCGMouseButtonLeft)
-                    Quartz.CGEventPostToPid(pid, ev)
-                    time.sleep(0.05)
-                ql_clicked = True
-            else:
-                logger.warning("经营线索：无法点击去联系按钮")
-                return
+    def _find_first_huashu_send_btn(self, popup):
+        """popup 里找'话术' label 之下第一个 AXButton title='去发送'。"""
+        huashu_y = None
+        for st in _deep_find_all(popup, "AXStaticText", max_depth=14):
+            try:
+                v = str(getattr(st, "AXValue", "") or "").strip()
+                if v == "话术":
+                    pos = getattr(st, "AXPosition", None)
+                    if pos:
+                        huashu_y = pos[1]
+                        break
+            except Exception:
+                continue
+        if huashu_y is None:
+            return None
+        candidates = []
+        for btn in _deep_find_all(popup, "AXButton", max_depth=14):
+            try:
+                t = str(getattr(btn, "AXTitle", "") or "").strip()
+                if t == "去发送":
+                    pos = getattr(btn, "AXPosition", None)
+                    if pos and pos[1] > huashu_y:
+                        candidates.append((pos[1], btn))
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
 
-        self._processed_leads.add(lead_hash)
-        logger.info("经营线索：已点击去联系（线索 hash=%s）", lead_hash[:12])
+    def _find_button_in_popups(self, title_substring: str):
+        """在所有非主窗口里找 title 含 substring 的 AXButton（第一个）。"""
+        try:
+            wins = self._get_app().AXWindows
+        except Exception:
+            return None
+        for w in wins:
+            try:
+                wt = str(getattr(w, "AXTitle", "") or "").strip()
+            except Exception:
+                continue
+            if wt == "企业微信":
+                continue
+            for btn in _deep_find_all(w, "AXButton", max_depth=10):
+                try:
+                    t = str(getattr(btn, "AXTitle", "") or "")
+                    if title_substring in t:
+                        return btn
+                except Exception:
+                    continue
+        return None
 
-        # 等待确认弹窗（"确定跳转" 对话框）出现
-        time.sleep(1.5)
-        self._click_confirm_dialog(pid)
+    def _paste_and_send_in_chat(self, pid) -> bool:
+        """在主窗口当前聊天的输入框 PostToPid 鼠标点击 → Cmd+V → Enter。"""
+        import Quartz
+        try:
+            window = self._get_main_window()
+        except Exception:
+            return False
 
-        # 清理残留的线索详情弹窗（防止窗口堆积）
-        time.sleep(0.5)
-        self._close_xiansuo_popups()
+        # 找单聊输入框：跳过会话列表的 'BOT' 标记，选 x>300 且尺寸大的 AXTextArea
+        text_areas = _deep_find_all(window, "AXTextArea", max_depth=15)
+        candidates = []
+        for ta in text_areas:
+            try:
+                val = str(getattr(ta, "AXValue", "") or "")
+                if val.replace("​", "").strip() == "BOT":
+                    continue
+                pos = getattr(ta, "AXPosition", None)
+                sz = getattr(ta, "AXSize", None)
+                if pos and sz and sz[0] > 500 and sz[1] > 50 and pos[0] > 300:
+                    candidates.append((sz[0] * sz[1], pos, sz, ta))
+            except Exception:
+                continue
+        if not candidates:
+            logger.warning("经营线索：未找到单聊输入框")
+            return False
+        # 优先选 y 最大的（输入框在底部），同时面积要够大
+        candidates.sort(key=lambda x: (x[1][1], x[0]), reverse=True)
+        _, pos, sz, input_box = candidates[0]
+
+        cx = pos[0] + sz[0] / 2
+        cy = pos[1] + sz[1] / 2
+
+        try:
+            # PostToPid 鼠标点击输入框获取焦点
+            pt = Quartz.CGPointMake(cx, cy)
+            for et in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(None, et, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPostToPid(pid, ev)
+                time.sleep(0.05)
+            time.sleep(0.4)
+
+            # Cmd+V (V = keycode 9)
+            for down in (True, False):
+                ev = Quartz.CGEventCreateKeyboardEvent(None, 9, down)
+                Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
+                Quartz.CGEventPostToPid(pid, ev)
+                time.sleep(0.05)
+            time.sleep(0.4)
+
+            # Enter (keycode 36) 发送
+            for down in (True, False):
+                ev = Quartz.CGEventCreateKeyboardEvent(None, 36, down)
+                Quartz.CGEventPostToPid(pid, ev)
+                time.sleep(0.05)
+            time.sleep(0.3)
+
+            # 验证输入框已清空（消息已发送）
+            try:
+                after = str(getattr(input_box, "AXValue", "") or "")
+                if not after.strip():
+                    return True
+                logger.warning("经营线索：粘贴后输入框非空 %r，发送可能未生效", after[:60])
+            except Exception:
+                # 引用失效但很可能已发送
+                return True
+        except Exception as exc:
+            logger.warning("经营线索：粘贴发送异常：%s", exc)
+        return False
 
     def _click_confirm_dialog(self, pid) -> None:
         """点击"确定"/"确定跳转" 确认弹窗。"""

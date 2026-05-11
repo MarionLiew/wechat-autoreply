@@ -1406,54 +1406,15 @@ class WeChatWatcher:
                 logger.warning("经营线索：无法点击线索详情链接")
                 return
 
-        # 等 popup 加载完成（出现"会员信息"等稳定标识），最多 5s
+        # 等 popup 加载完成（最多 5s）。仅用于让 popup 有时间初始化，不在
+        # popup 里读"添加企微"状态——实测 popup 没有该状态文字，且常常只有
+        # 1 条 StaticText（'客户经营专区' 这种标识），展开+解析没意义。
+        # 分流的实际依据是下面的"去联系按钮存不存在"。
         time.sleep(0.5)
-        popup_win = None
         for _ in range(10):
-            popup_win = self._find_lead_popup()
-            if popup_win is not None:
+            if self._find_lead_popup() is not None:
                 break
             time.sleep(0.5)
-
-        # 展开"会员信息"区，读取"是否添加企微"状态
-        # popup 里头像/扩展数据是异步加载的，需要等"加载中..."消失才能展开。
-        if popup_win is not None:
-            # 等"加载中..."消失，最多 5s
-            for _ in range(10):
-                loading = False
-                for st in _deep_find_all(popup_win, "AXStaticText", max_depth=12):
-                    try:
-                        v = str(getattr(st, "AXValue", "") or "").strip()
-                        if v == "加载中...":
-                            loading = True
-                            break
-                    except Exception:
-                        continue
-                if not loading:
-                    break
-                time.sleep(0.5)
-            else:
-                logger.debug("经营线索：'加载中...' 5s 内未消失，仍尝试展开")
-
-            self._expand_member_info_section(popup_win, pid)
-            # 展开后等内容渲染（之前 1.2s 不够，调成 3s）。
-            # 期间继续检测"加载中..."并 poll。
-            for _ in range(6):
-                time.sleep(0.5)
-                loading = False
-                for st in _deep_find_all(popup_win, "AXStaticText", max_depth=12):
-                    try:
-                        v = str(getattr(st, "AXValue", "") or "").strip()
-                        if v == "加载中...":
-                            loading = True
-                            break
-                    except Exception:
-                        continue
-                if not loading:
-                    break
-
-            qiwei_status = self._read_qiwei_status(popup_win)
-            logger.info("经营线索：客户添加企微状态 = %r", qiwei_status)
 
         # 轮询等待"去联系"按钮出现（最多 8s，每 1s 检查一次）
         # 注意：客户未添加企微时，popup 里根本没有"去联系"按钮，永远等不到。
@@ -1467,16 +1428,18 @@ class WeChatWatcher:
                 continue
             qulianxi = self._find_qulianxi(window)
             if qulianxi is not None:
-                logger.info("经营线索：找到去联系按钮（第 %d 次轮询）", attempt + 1)
+                logger.info(
+                    "经营线索：客户【已添加企微】✓（第 %d 次轮询找到去联系按钮）",
+                    attempt + 1,
+                )
                 break
             logger.debug("经营线索：第 %d 次轮询未找到去联系，继续等待…", attempt + 1)
 
         if qulianxi is None:
             # 标记此线索已处理，避免下一轮 tick 重复打开 popup 死循环。
-            # 客户未添加企微 → 没有去联系按钮 → 此线索目前无法自动处理，跳过。
             self._processed_leads.add(lead_hash)
             logger.warning(
-                "经营线索：未找到去联系按钮（客户可能未添加企微），跳过此线索 hash=%s",
+                "经营线索：客户【未添加企微】✗（8s 内无去联系按钮），跳过 hash=%s",
                 lead_hash[:12],
             )
             self._close_xiansuo_popups()

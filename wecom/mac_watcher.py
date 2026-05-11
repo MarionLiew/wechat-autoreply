@@ -1460,10 +1460,12 @@ class WeChatWatcher:
         )
 
         if popup_win is None:
+            # 诊断 dump：popup 里到底有什么 StaticText 和 Button
             logger.warning(
                 "经营线索：popup 未在 20s 内出现'话术' label，放弃 hash=%s",
                 lead_hash[:12],
             )
+            self._dump_current_popups("没找到话术 label 诊断")
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return
@@ -1623,6 +1625,42 @@ class WeChatWatcher:
                 pass
             time.sleep(0.3)
         return False
+
+    def _dump_current_popups(self, reason: str) -> None:
+        """诊断用：dump 所有非主窗口（popup）里 y<800 的 button/text 到 log。"""
+        try:
+            wins = self._get_app().AXWindows
+        except Exception:
+            return
+        logger.info("=== popup 诊断: %s ===", reason)
+        for i, w in enumerate(wins):
+            try:
+                wt = str(getattr(w, "AXTitle", "") or "").strip()
+                pos = getattr(w, "AXPosition", None)
+                sz = getattr(w, "AXSize", None)
+            except Exception:
+                continue
+            if wt == "企业微信":
+                continue
+            logger.info("  popup[%d] title=%r pos=%s sz=%s", i, wt, pos, sz)
+            # dump 浅层 button + statictext
+            elems = []
+            for role in ("AXButton", "AXStaticText"):
+                for el in _deep_find_all(w, role, max_depth=8):
+                    try:
+                        pos = getattr(el, "AXPosition", None)
+                        if not pos:
+                            continue
+                        t = str(getattr(el, "AXTitle", "") or "")[:40]
+                        v = str(getattr(el, "AXValue", "") or "")[:40]
+                        if not (t or v):
+                            continue
+                        elems.append((pos[1], pos[0], role, t, v))
+                    except Exception:
+                        continue
+            elems.sort()
+            for y, x, role, t, v in elems[:25]:
+                logger.info("    y=%.0f x=%.0f [%s] title=%r val=%r", y, x, role, t, v)
 
     def _find_first_huashu_send_btn(self, popup):
         """popup 里找'话术' label 之下第一个 AXButton title='去发送'。"""

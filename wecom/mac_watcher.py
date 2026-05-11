@@ -1455,9 +1455,17 @@ class WeChatWatcher:
         # 等 popup 加载完成。就绪 = 存在某个非主窗口含 "话术" label。
         # 给 Chromium 起一下 + 长 timeout（话术区在 popup 底部，渲染慢）。
         time.sleep(2.0)
+        # 先快速试一下：popup 顶部加载时话术可能已在 AX 树
         popup_win = self._wait_for_signal(
-            "话术", mode="static", timeout=20.0, poll_interval=1.0,
+            "话术", mode="static", timeout=4.0, poll_interval=0.8,
         )
+        # 不在视口里 → 滚动 popup 到底部，让"话术"label 出现在 AX 树
+        if popup_win is None:
+            logger.info("经营线索：popup 顶部未见'话术' label，滚动到底部再找")
+            self._scroll_popup_to_bottom(pid)
+            popup_win = self._wait_for_signal(
+                "话术", mode="static", timeout=15.0, poll_interval=1.0,
+            )
 
         if popup_win is None:
             # 诊断 dump：popup 里到底有什么 StaticText 和 Button
@@ -1626,6 +1634,63 @@ class WeChatWatcher:
                 pass
             time.sleep(0.3)
         return False
+
+    def _scroll_popup_to_bottom(self, pid) -> None:
+        """让 popup 滚到底部，让话术区域出现在 AX 树。
+
+        策略：先点击 popup 中部让它获得键盘焦点，再连发几次 PageDown，
+        最后发 End 键确保到底。
+        """
+        import Quartz
+        # 找当前 popup 中心点
+        try:
+            wins = self._get_app().AXWindows
+        except Exception:
+            return
+        popup = None
+        for w in wins:
+            try:
+                wt = str(getattr(w, "AXTitle", "") or "").strip()
+                sz = getattr(w, "AXSize", None)
+                pos = getattr(w, "AXPosition", None)
+            except Exception:
+                continue
+            if wt == "企业微信" or not sz or not pos or sz[0] < 300:
+                continue
+            popup = (pos, sz)
+            break
+        if popup is None:
+            return
+
+        pos, sz = popup
+        cx = pos[0] + sz[0] / 2
+        cy = pos[1] + sz[1] / 2
+
+        try:
+            # 鼠标点中部聚焦
+            pt = Quartz.CGPointMake(cx, cy)
+            for et in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                ev = Quartz.CGEventCreateMouseEvent(None, et, pt, Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPostToPid(pid, ev)
+                time.sleep(0.05)
+            time.sleep(0.3)
+
+            # 连续 PageDown ×6（keycode 121 = PageDown）确保滚到底
+            for _ in range(6):
+                for down in (True, False):
+                    ev = Quartz.CGEventCreateKeyboardEvent(None, 121, down)
+                    Quartz.CGEventPostToPid(pid, ev)
+                    time.sleep(0.03)
+                time.sleep(0.15)
+            # End 键（keycode 119）
+            for down in (True, False):
+                ev = Quartz.CGEventCreateKeyboardEvent(None, 119, down)
+                Quartz.CGEventPostToPid(pid, ev)
+                time.sleep(0.05)
+            time.sleep(0.4)
+            logger.info("经营线索：popup 已滚动到底部")
+        except Exception as exc:
+            logger.debug("经营线索：popup 滚动异常：%s", exc)
 
     def _dump_current_popups(self, reason: str) -> None:
         """诊断用：dump 所有非主窗口（popup）里 y<800 的 button/text 到 log。"""

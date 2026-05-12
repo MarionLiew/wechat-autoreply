@@ -2477,13 +2477,31 @@ def _force_click_conv_row(row, pid) -> bool:
 
 
 def _osascript_click_conv_row(row) -> bool:
-    """真鼠标点击：先用 osascript 激活 WeCom，然后 Quartz CGEventPost 全局事件
-    （会移动用户的光标到目标位置再点击）——这是最接近真人操作的方式，能突破
-    WeCom 在某些状态下"模拟 click 无效"的死锁。
+    """真鼠标点击：先激活 WeCom + 让 row 滚到可视区域，然后 Quartz HID 鼠标点击。
+
+    关键修复：conv list 滚动后，row.AXPosition 仍是逻辑绝对坐标（y 可能几千），
+    超出窗口可见区域时直接 click 不生效。点击前先 set AXSelected=True 强制
+    WeCom 滚动让 row 进入可视区域，再 fresh 读 position。
     """
     import subprocess
     import Quartz
     try:
+        # 1) 激活 WeCom
+        subprocess.run(
+            ["osascript", "-e", 'tell application "企业微信" to activate'],
+            capture_output=True, timeout=3,
+        )
+        time.sleep(0.25)
+
+        # 2) 强制 WeCom 滚动让 row 可见。AXSelected=True 通常会触发
+        #    "确保 selected row 可见" 的 scroll
+        try:
+            row.AXSelected = True
+        except Exception:
+            pass
+        time.sleep(0.3)  # 等滚动完成
+
+        # 3) Fresh 读 row 位置（滚动后坐标会变到 visible 范围）
         pos = getattr(row, "AXPosition", None)
         sz  = getattr(row, "AXSize", None)
         if not pos or not sz:
@@ -2491,12 +2509,13 @@ def _osascript_click_conv_row(row) -> bool:
         cx = pos[0] + sz[0] / 2
         cy = pos[1] + sz[1] / 2
 
-        # 1) 激活 WeCom
-        subprocess.run(
-            ["osascript", "-e", 'tell application "企业微信" to activate'],
-            capture_output=True, timeout=3,
-        )
-        time.sleep(0.25)
+        # 4) 校验在屏幕内（WeCom 窗口通常 y < 1400）。若仍超出说明滚动没生效
+        if cy > 1500 or cy < 30:
+            logger.warning(
+                "row 仍在屏幕外 (%.0f, %.0f)，AXSelected 滚动可能失败",
+                cx, cy,
+            )
+            return False
 
         # 2) Quartz 物理级鼠标事件：用 HID source（最难和真鼠标区分）+ ClickState=1
         pt = Quartz.CGPointMake(cx, cy)

@@ -1084,113 +1084,7 @@ class WeChatWatcher:
                 else:
                     logger.info("跳过鼠标点击：pid=%s pos=%s sz=%s", pid, pos, sz)
 
-            # ② 切前台 + PostToPid 鼠标 + PostToPid Enter
-            # 逻辑：先让企微成为 OS key window（osascript set frontmost），
-            # 再 PostToPid 鼠标点击输入框（让 Chromium 把内部焦点给输入框），
-            # 再 PostToPid Enter（企微是 key window + Chromium 焦点在输入框 → 成功）。
-            # probe 测试已证明"鼠标 PostToPid + Enter PostToPid"在企微刚激活时可行；
-            # 此处主动先激活，确保条件成立。
-            if not enter_method and pos and sz and pid:
-                try:
-                    import subprocess
-                    # Step 1: 切前台，记录前任前台 app
-                    make_front_script = (
-                        'tell application "System Events"\n'
-                        '    set prevApp to name of first process whose frontmost is true\n'
-                        '    set frontmost of (first process whose bundle identifier is "'
-                        + settings.wecom_bundle_id
-                        + '") to true\n'
-                        '    delay 0.2\n'
-                        '    return prevApp\n'
-                        'end tell\n'
-                    )
-                    r1 = subprocess.run(
-                        ["osascript", "-e", make_front_script],
-                        capture_output=True, text=True, timeout=3,
-                    )
-                    prev_app = r1.stdout.strip()
-                    logger.info("切前台完成，prev=%r", prev_app)
-
-                    # Step 2: PostToPid 鼠标点击输入框（企微已是前台，Chromium 会接受焦点）
-                    import Quartz as _Q
-                    cx2 = pos[0] + sz[0] / 2
-                    cy2 = pos[1] + sz[1] / 2
-                    pt = _Q.CGPointMake(cx2, cy2)
-                    _Q.CGEventPostToPid(pid, _Q.CGEventCreateMouseEvent(
-                        None, _Q.kCGEventLeftMouseDown, pt, _Q.kCGMouseButtonLeft))
-                    time.sleep(0.05)
-                    _Q.CGEventPostToPid(pid, _Q.CGEventCreateMouseEvent(
-                        None, _Q.kCGEventLeftMouseUp, pt, _Q.kCGMouseButtonLeft))
-                    time.sleep(0.1)
-
-                    # Step 3: 重写文本（点击可能清除原内容）
-                    try:
-                        setattr(input_box, "AXValue", reply_text)
-                        time.sleep(0.05)
-                    except Exception:
-                        pass
-
-                    # Step 4: PostToPid Enter（企微是 key window，Chromium 焦点在输入框）
-                    logger.info("flash-front+PostToPid-mouse+Enter（坐标=%.0f,%.0f）", cx2, cy2)
-                    for down in (True, False):
-                        ev = _Q.CGEventCreateKeyboardEvent(None, 36, down)
-                        _Q.CGEventPostToPid(pid, ev)
-                    time.sleep(0.3)
-
-                    # Step 5: 切回原前台
-                    if prev_app:
-                        try:
-                            subprocess.run(
-                                ["osascript", "-e",
-                                 f'tell application "System Events" to set frontmost of process "{prev_app}" to true'],
-                                capture_output=True, timeout=2,
-                            )
-                        except Exception:
-                            pass
-
-                    if _verify_sent():
-                        enter_method = "flash-front+PostToPid-mouse+Enter"
-                    else:
-                        logger.warning("flash-front+PostToPid-mouse+Enter 后输入框仍有文本")
-                except Exception as exc:
-                    logger.warning("flash-front+PostToPid-mouse+Enter 异常：%s", exc)
-
-            # ③ sendKeys("\r") 兜底
-            if not enter_method:
-                try:
-                    input_box.sendKeys("\r")
-                    time.sleep(0.3)
-                    if _verify_sent():
-                        enter_method = "sendKeys(\\r)"
-                    else:
-                        logger.warning("sendKeys 回车后输入框仍有文本，Enter 未生效")
-                except Exception as exc:
-                    logger.debug("sendKeys 回车失败：%s", exc)
-
-            # ④ osascript keystroke return（最后兜底）：通过 System Events 真键盘事件
-            # 经营大厅等功能浮层会吃掉 PostToPid 路由的 Enter，但 osascript keystroke
-            # 是系统级，浮层无法拦截。代价：拉 WeCom 到前台 0.5s。
-            if not enter_method:
-                try:
-                    import subprocess
-                    script = (
-                        'tell application "企业微信" to activate\n'
-                        'delay 0.2\n'
-                        'tell application "System Events" to keystroke return\n'
-                    )
-                    r = subprocess.run(
-                        ["osascript", "-e", script],
-                        capture_output=True, text=True, timeout=4,
-                    )
-                    time.sleep(0.4)
-                    if r.returncode == 0 and _verify_sent():
-                        enter_method = "osascript-keystroke-return"
-                    else:
-                        logger.warning("osascript keystroke return 后输入框仍有文本")
-                except Exception as exc:
-                    logger.debug("osascript keystroke return 失败：%s", exc)
-
-            # ⑤ Spotlight 等效重新激活：`open -a 企业微信` 触发 OS 级 LSOpen，
+            # ② Spotlight 等效重新激活：`open -a 企业微信` 触发 OS 级 LSOpen，
             # 经营大厅浮层在此次激活中常被自动 dismiss / 焦点重置。
             # 之后重新 PostToPid 点输入框，必要时补写，再 keystroke return。
             if not enter_method and pid and pos and sz:
@@ -1200,7 +1094,7 @@ class WeChatWatcher:
                         ["open", "-a", "企业微信"],
                         capture_output=True, text=True, timeout=3,
                     )
-                    logger.info("⑤ open -a 企业微信（等价 Spotlight），重试 Enter")
+                    logger.info("② open -a 企业微信（等价 Spotlight），重试 Enter")
                     time.sleep(1.2)  # 等激活生效 + 浮层重排
 
                     # 重新 PostToPid 点输入框拿回 Chromium 焦点
@@ -1234,9 +1128,9 @@ class WeChatWatcher:
                     if _verify_sent():
                         enter_method = "reactivate-spotlight+keystroke-return"
                     else:
-                        logger.warning("⑤ Spotlight 等效重新激活后仍未发送")
+                        logger.warning("② Spotlight 等效重新激活后仍未发送")
                 except Exception as exc:
-                    logger.warning("⑤ Spotlight 重新激活兜底异常：%s", exc)
+                    logger.warning("② Spotlight 重新激活兜底异常：%s", exc)
 
             method_label = f"{used_method}+{enter_method}"
             if enter_method:

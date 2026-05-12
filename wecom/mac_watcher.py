@@ -1549,21 +1549,20 @@ class WeChatWatcher:
         popup_win = self._wait_for_signal(
             "话术", mode="static", timeout=4.0, poll_interval=0.8,
         )
-        # 不在视口里 → 滚动 popup 到底部，让"话术"label 出现在 AX 树
+        # 不在视口里 → 滚动 popup 到底部，让"话术"label 出现在 AX 树。
+        # 滚到底仍找不到 = 这条线索本身没分配话术（多见于"显示昵称但未真正加企微"的情况）→ 快速放弃
         if popup_win is None:
             logger.info("经营线索：popup 顶部未见'话术' label，滚动到底部再找")
             self._scroll_popup_to_bottom(pid)
             popup_win = self._wait_for_signal(
-                "话术", mode="static", timeout=15.0, poll_interval=1.0,
+                "话术", mode="static", timeout=4.0, poll_interval=0.5,
             )
 
         if popup_win is None:
-            # 诊断 dump：popup 里到底有什么 StaticText 和 Button
-            logger.warning(
-                "经营线索：popup 未在 20s 内出现'话术' label，放弃 hash=%s",
+            logger.info(
+                "经营线索：popup 无话术（疑似客户未真正加企微），跳过本条 hash=%s",
                 lead_hash[:12],
             )
-            self._dump_current_popups("没找到话术 label 诊断")
             self._processed_leads.add(lead_hash)
             self._close_xiansuo_popups()
             return

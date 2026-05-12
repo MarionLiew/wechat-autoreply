@@ -32,7 +32,7 @@ except ImportError:
 
 from config import settings
 from reply import engine
-from storage import message_log
+from storage import leads_log, message_log
 
 logger = logging.getLogger(__name__)
 
@@ -1617,9 +1617,11 @@ class WeChatWatcher:
 
         # 5) Cmd+V 粘贴 + Enter 发送
         if self._paste_and_send_in_chat(pid):
+            leads_log.record_lead_sent(traveler, lead_hash)
+            today_count = leads_log.count_today()
             logger.info(
-                "经营线索：✅ 全流程完成 旅客=%s hash=%s 话术已发送",
-                traveler, lead_hash[:12],
+                "经营线索：✅ 全流程完成 旅客=%s hash=%s 话术已发送 📊 今日累计 %d 条",
+                traveler, lead_hash[:12], today_count,
             )
         else:
             logger.warning(

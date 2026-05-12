@@ -439,15 +439,23 @@ class WeChatWatcher:
                 if fresh is not None:
                     conv_row = fresh
 
-            # 切换会话：优先 PostToPid 鼠标点击（真实事件触发 visible panel 切换），
-            # 失败再用 AX 级 Press。注意 _press_conv_row 走 AXSelected 兜底时
-            # 只"选中"行不切换 panel——所以不能让它做主路径，否则 verify 会读到
-            # stale chat header（上一个 sender 的）造成连环误判。
+            # 切换会话三档：
+            # 1. PostToPid 鼠标（最静默，正常状态下生效）
+            # 2. AX Press（兜底，会走 AXSelected 但不真切 panel）
+            # 3. 第 2+ 次重试且前面都失败时 → osascript click（会瞬间拉前台但最可靠）
             pressed = False
             if pid:
                 pressed = _force_click_conv_row(conv_row, pid)
             if not pressed:
                 pressed = _press_conv_row(conv_row)
+            # 第 2 次起 + chat header 一直读不到 → 用 osascript 兜底
+            if attempt >= 1:
+                logger.info(
+                    "[%s] 第 %d 次重试改用 osascript click（拉前台破解死局）",
+                    expected_sender, attempt + 1,
+                )
+                _osascript_click_conv_row(conv_row)
+                pressed = True
             if not pressed:
                 logger.error("[%s] AX 与鼠标点击都未能切换会话", expected_sender or "?")
                 if attempt + 1 >= attempts:
@@ -2438,12 +2446,7 @@ def _parse_lead_message(text: str) -> tuple[str, str | None]:
 
 
 def _force_click_conv_row(row, pid) -> bool:
-    """PostToPid 鼠标点击会话行中心，强制让 Chromium 切换可见聊天面板。
-
-    与 _press_conv_row（仅 AX 操作）不同，这里用真实鼠标事件触发 Chromium
-    内部的会话切换，能突破 AXSelected = True 兜底"只选中不切换面板"的死局。
-    PostToPid 定向投递事件给指定 pid，不让该 app 进入前台/抢焦点。
-    """
+    """PostToPid 鼠标点击会话行中心，强制让 Chromium 切换可见聊天面板。"""
     try:
         import Quartz
         pos = getattr(row, "AXPosition", None)
@@ -2462,6 +2465,43 @@ def _force_click_conv_row(row, pid) -> bool:
     except Exception as exc:
         logger.warning("PostToPid 点击会话行失败：%s", exc)
         return False
+
+
+def _osascript_click_conv_row(row) -> bool:
+    """osascript 鼠标点击会话行中心：会瞬间把 WeCom 调前台再点。
+
+    破解 PostToPid 死局——某些 WeCom 状态下 PostToPid 鼠标不被 Chromium 内部
+    识别（chat panel 不切换）。osascript 走真正的系统级鼠标事件，最可靠。
+    代价：临时把 WeCom 拉到前台（~0.5s）。
+    """
+    import subprocess
+    try:
+        pos = getattr(row, "AXPosition", None)
+        sz  = getattr(row, "AXSize", None)
+        if not pos or not sz:
+            return False
+        cx = pos[0] + sz[0] / 2
+        cy = pos[1] + sz[1] / 2
+        script = f'''
+        tell application "System Events"
+            tell process "企业微信"
+                set frontmost to true
+                delay 0.2
+                click at {{{cx:.0f}, {cy:.0f}}}
+            end tell
+        end tell
+        '''
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            logger.info("osascript 点击会话行中心 (%.0f, %.0f)", cx, cy)
+            return True
+        logger.warning("osascript 点击会话行失败 rc=%s err=%s", r.returncode, r.stderr[:120])
+    except Exception as exc:
+        logger.warning("osascript 点击会话行异常：%s", exc)
+    return False
 
 
 def _press_conv_row(row) -> bool:

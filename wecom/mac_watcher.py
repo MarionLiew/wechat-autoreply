@@ -122,6 +122,9 @@ class WeChatWatcher:
         if not text:
             return False
         t = text.replace(" ", "")
+        # 0. WeCom "[草稿] ..." 是对方正在输入但未发送的草稿，不是真消息
+        if t.startswith("[草稿]") or t.startswith("[草稿]"):
+            return True
         # 1. 企微"我已经添加了你"系统消息
         if "我已经添加了你" in t and "可以开始聊天" in t:
             return True

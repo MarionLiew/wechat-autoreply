@@ -2477,9 +2477,10 @@ def _force_click_conv_row(row, pid) -> bool:
 
 
 def _osascript_click_conv_row(row) -> bool:
-    """osascript 真鼠标点击会话行中心。先用 `tell application 企业微信 to activate`
-    把 WeCom 真激活到前台（比 `set frontmost to true` 更彻底，能突破 WeCom 主
-    聊天区空状态时的 click 死锁），然后通过 System Events 发送 click。
+    """osascript 真鼠标点击会话行中心 + 回车强制打开。
+
+    WeCom 在主聊天区显示占位图状态下，**单 click 不会切换 chat panel**。
+    需要 click 选中行后立即按"回车"明确触发"打开聊天"动作。
     """
     import subprocess
     try:
@@ -2495,6 +2496,8 @@ def _osascript_click_conv_row(row) -> bool:
         tell application "System Events"
             tell process "企业微信"
                 click at {{{cx:.0f}, {cy:.0f}}}
+                delay 0.15
+                key code 36
             end tell
         end tell
         '''
@@ -2503,7 +2506,7 @@ def _osascript_click_conv_row(row) -> bool:
             capture_output=True, text=True, timeout=5,
         )
         if r.returncode == 0:
-            logger.info("osascript activate+click 会话行中心 (%.0f, %.0f)", cx, cy)
+            logger.info("osascript activate+click+回车 会话行中心 (%.0f, %.0f)", cx, cy)
             return True
         logger.warning("osascript 点击会话行失败 rc=%s err=%s", r.returncode, r.stderr[:120])
     except Exception as exc:

@@ -854,11 +854,79 @@ with tab_settings:
         excluded_senders = ",".join(excluded_multi + _extra_list)
 
     st.divider()
+    # ── RAG 话术层（客户经理风格蒸馏） ─────────────────────
+    st.subheader("RAG 话术层（按客户经理蒸馏）")
+    st.caption(
+        "从客户经理历史聊天记录里检索相似 QA 对：高分直接复用历史回复，"
+        "中分作为 few-shot 喂给 LLM 学风格。索引由 scripts/build_rag_index.py 生成。"
+    )
+
+    rag_index_root = _ROOT / "data" / "rag_index"
+    available_managers = []
+    if rag_index_root.exists():
+        for d in sorted(rag_index_root.iterdir()):
+            if d.is_dir() and (d / "embeddings.npy").exists():
+                available_managers.append(d.name)
+
+    if not available_managers:
+        st.warning(
+            "暂无可用 RAG 索引。请将客户经理聊天记录放到 `data/`，"
+            "然后运行：\n```\npython scripts/extract_qa_pairs.py\npython scripts/build_rag_index.py\n```"
+        )
+
+    rag_col1, rag_col2 = st.columns(2)
+    with rag_col1:
+        rag_enabled = st.toggle(
+            "启用 RAG 话术层",
+            value=_cur.rag_enabled if available_managers else False,
+            disabled=not available_managers,
+            help="开启后在关键词规则之后插入 RAG 层。需要先构建索引。",
+        )
+        if available_managers:
+            _cur_mgr = _cur.rag_manager if _cur.rag_manager in available_managers else available_managers[0]
+            rag_manager = st.selectbox(
+                "客户经理（模仿话术风格）",
+                options=available_managers,
+                index=available_managers.index(_cur_mgr),
+                help="bot 会用这位客户经理的过往话术风格回复",
+            )
+            _meta_path = rag_index_root / rag_manager / "metadata.jsonl"
+            if _meta_path.exists():
+                with _meta_path.open(encoding="utf-8") as f:
+                    n_qa = sum(1 for _ in f)
+                st.caption(f"📚 {rag_manager} 索引：{n_qa:,} 条 QA 对")
+        else:
+            rag_manager = _cur.rag_manager
+            st.text_input("客户经理", value=rag_manager, disabled=True)
+
+    with rag_col2:
+        rag_direct_threshold = st.slider(
+            "A 路径阈值（直接复用历史回复）",
+            min_value=0.50, max_value=1.0, step=0.01,
+            value=float(_cur.rag_direct_threshold),
+            help="检索 top-1 分数 ≥ 此值且回复安全时，直接复用历史回复（自动替换客户姓名）",
+        )
+        rag_fewshot_threshold = st.slider(
+            "B 路径阈值（few-shot 喂 LLM）",
+            min_value=0.30, max_value=0.95, step=0.01,
+            value=float(_cur.rag_fewshot_threshold),
+            help="分数 ≥ 此值但低于 A 阈值时，用检索结果做 few-shot 喂给 LLM 生成回复",
+        )
+        rag_topk = st.number_input(
+            "检索结果数（top-K）",
+            min_value=1, max_value=10, step=1,
+            value=int(_cur.rag_topk),
+            help="B 路径时把 top-K 条 QA 对作为风格示范喂给 LLM",
+        )
+
+    st.divider()
     if st.button("💾 保存设置", type="primary"):
         # 校验
         errs = []
         if delay_min > delay_max:
             errs.append("最小延迟不能大于最大延迟")
+        if rag_enabled and rag_fewshot_threshold >= rag_direct_threshold:
+            errs.append("RAG B 阈值必须小于 A 阈值（否则 B 路径永远进不来）")
         if errs:
             for e in errs:
                 st.error(e)
@@ -874,6 +942,11 @@ with tab_settings:
                 "LLM_RATE_LIMIT_PER_MINUTE": f"{int(llm_rate)}",
                 "SYSTEM_PROMPT": system_prompt,
                 "EXCLUDED_SENDERS": excluded_senders,
+                "RAG_ENABLED": "true" if rag_enabled else "false",
+                "RAG_MANAGER": rag_manager,
+                "RAG_DIRECT_THRESHOLD": f"{rag_direct_threshold}",
+                "RAG_FEWSHOT_THRESHOLD": f"{rag_fewshot_threshold}",
+                "RAG_TOPK": f"{int(rag_topk)}",
             })
             st.success("已保存。请重启守护进程使设置生效。")
 
@@ -887,6 +960,11 @@ with tab_settings:
             "llm_enabled": _cur.llm_enabled,
             "excluded_senders": _cur.excluded_senders,
             "wecom_bundle_id": _cur.wecom_bundle_id,
+            "rag_enabled": _cur.rag_enabled,
+            "rag_manager": _cur.rag_manager,
+            "rag_direct_threshold": _cur.rag_direct_threshold,
+            "rag_fewshot_threshold": _cur.rag_fewshot_threshold,
+            "rag_topk": _cur.rag_topk,
         })
 
 

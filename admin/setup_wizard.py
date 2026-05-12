@@ -70,6 +70,11 @@ def read_current_config() -> dict:
         "LOG_LEVEL": vals.get("LOG_LEVEL", "INFO"),
         "DATABASE_URL": vals.get("DATABASE_URL", "sqlite:///./messages.db"),
         "WECOM_BUNDLE_ID": vals.get("WECOM_BUNDLE_ID", "com.tencent.WeWorkMac"),
+        "RAG_ENABLED": vals.get("RAG_ENABLED", "false").lower() == "true",
+        "RAG_MANAGER": vals.get("RAG_MANAGER", "罗响"),
+        "RAG_DIRECT_THRESHOLD": float(vals.get("RAG_DIRECT_THRESHOLD", "0.85")),
+        "RAG_FEWSHOT_THRESHOLD": float(vals.get("RAG_FEWSHOT_THRESHOLD", "0.55")),
+        "RAG_TOPK": int(vals.get("RAG_TOPK", "3")),
     }
 
 

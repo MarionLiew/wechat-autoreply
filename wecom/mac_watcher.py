@@ -1190,6 +1190,54 @@ class WeChatWatcher:
                 except Exception as exc:
                     logger.debug("osascript keystroke return 失败：%s", exc)
 
+            # ⑤ Spotlight 等效重新激活：`open -a 企业微信` 触发 OS 级 LSOpen，
+            # 经营大厅浮层在此次激活中常被自动 dismiss / 焦点重置。
+            # 之后重新 PostToPid 点输入框，必要时补写，再 keystroke return。
+            if not enter_method and pid and pos and sz:
+                try:
+                    import subprocess
+                    subprocess.run(
+                        ["open", "-a", "企业微信"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    logger.info("⑤ open -a 企业微信（等价 Spotlight），重试 Enter")
+                    time.sleep(1.2)  # 等激活生效 + 浮层重排
+
+                    # 重新 PostToPid 点输入框拿回 Chromium 焦点
+                    import Quartz as _Q5
+                    cx5 = pos[0] + sz[0] / 2
+                    cy5 = pos[1] + sz[1] / 2
+                    pt5 = _Q5.CGPointMake(cx5, cy5)
+                    for et in (_Q5.kCGEventLeftMouseDown, _Q5.kCGEventLeftMouseUp):
+                        ev = _Q5.CGEventCreateMouseEvent(None, et, pt5, _Q5.kCGMouseButtonLeft)
+                        _Q5.CGEventPostToPid(pid, ev)
+                        time.sleep(0.05)
+                    time.sleep(0.4)
+
+                    # 点击可能把文本清空，必要时补写
+                    try:
+                        cur = str(getattr(input_box, "AXValue", "") or "")
+                        if not cur.strip():
+                            setattr(input_box, "AXValue", reply_text)
+                            time.sleep(0.1)
+                    except Exception:
+                        pass
+
+                    # System Events keystroke return（系统级，吃不掉）
+                    subprocess.run(
+                        ["osascript", "-e",
+                         'tell application "System Events" to keystroke return'],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    time.sleep(0.5)
+
+                    if _verify_sent():
+                        enter_method = "reactivate-spotlight+keystroke-return"
+                    else:
+                        logger.warning("⑤ Spotlight 等效重新激活后仍未发送")
+                except Exception as exc:
+                    logger.warning("⑤ Spotlight 重新激活兜底异常：%s", exc)
+
             method_label = f"{used_method}+{enter_method}"
             if enter_method:
                 logger.info("已发送回复（方式=%s）：%s", method_label, reply_text[:60])

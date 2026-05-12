@@ -1426,6 +1426,16 @@ class WeChatWatcher:
             logger.info("经营线索：最新线索已处理过，跳过")
             return
 
+        # 类型白名单过滤——只处理用户指定的线索类型
+        lead_type = _parse_lead_type(parent_val)
+        if lead_type and lead_type not in LEAD_TYPE_WHITELIST:
+            self._processed_leads.add(lead_hash)
+            logger.info(
+                "经营线索：类型【%s】不在白名单，跳过（旅客=%s）",
+                lead_type, _parse_lead_message(parent_val)[0] or "?",
+            )
+            return
+
         # 根据消息文本里"微信昵称:"字段判断是否已添加企微：
         # - 已添加：'微信昵称:某某'  → 走开 popup + 点 去联系
         # - 未添加：'微信昵称:\n'    → 直接跳过，省 ~13s popup 耗时
@@ -1438,8 +1448,8 @@ class WeChatWatcher:
             )
             return
         logger.info(
-            "经营线索：客户【已添加企微】✓（旅客=%s, 微信昵称=%s）",
-            traveler or "?", qiwei_nick,
+            "经营线索：客户【已添加企微】✓ 类型=【%s】（旅客=%s, 微信昵称=%s）",
+            lead_type or "?", traveler or "?", qiwei_nick,
         )
 
         # 点击"线索详情>>"：双管齐下——先 AXPress 触发 webview 内部 click
@@ -2437,6 +2447,31 @@ def _read_chat_from_table(window, count: int) -> list[str]:
 
     logger.debug("_read_chat_from_table: 所有 AXTable 均无有效消息")
     return []
+
+
+# 线索类型白名单——只处理这些 【XX】 开头的线索
+LEAD_TYPE_WHITELIST: set[str] = {
+    "出行提醒",
+    "生日祝福",
+    "升级会员",
+    "航班延误",
+    "奖励机票K位",
+    "降级会员",
+    "里程未正常累积",
+}
+
+
+def _parse_lead_type(text: str) -> str:
+    """从线索文本提取类型，如 '【出行提醒】...' → '出行提醒'。找不到返回 ''。"""
+    if not text:
+        return ""
+    s = text.lstrip()
+    if not s.startswith("【"):
+        return ""
+    end = s.find("】")
+    if end <= 1:
+        return ""
+    return s[1:end].strip()
 
 
 def _parse_lead_message(text: str) -> tuple[str, str | None]:

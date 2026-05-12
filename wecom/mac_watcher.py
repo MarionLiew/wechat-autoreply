@@ -34,7 +34,7 @@ except ImportError:
     )
 
 from config import settings
-from reply import engine
+from reply import engine, manual_alert
 from storage import leads_log, mailer, message_log
 from storage.daily_stats import DailyTracker
 
@@ -2321,6 +2321,8 @@ class WeChatWatcher:
             latency_ms = int((time.monotonic() - t_start) * 1000)
             if sent:
                 self._daily.record_reply(result.get("source") or "")
+                # 客户消息含选座/改签/退票/升舱/查里程等"需人工"关键词 → 发邮件提醒
+                manual_alert.maybe_alert(sender, combined_text, result["content"])
                 self._processed.add(msg["msg_hash"])
                 # 内容级去重：记录本次回复的消息集合，下次见到相同集合直接跳过
                 self._last_replied_batch[sender] = content_batch

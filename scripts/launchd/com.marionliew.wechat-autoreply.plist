@@ -26,6 +26,10 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
 
+    <!-- SIGTERM 后给 30s 让优雅退出走完当前 tick（默认 5s，被经营线索流程超时） -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
     <!-- launchd 自己的标准输出/错误（与 Python 内部 RotatingFileHandler 的 daemon.log 分开） -->
     <key>StandardOutPath</key>
     <string>/Users/marionliew/Documents/Claude/wechat-autoreply/daemon.stdout.log</string>

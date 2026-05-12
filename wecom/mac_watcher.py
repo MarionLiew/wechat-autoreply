@@ -2477,12 +2477,12 @@ def _force_click_conv_row(row, pid) -> bool:
 
 
 def _osascript_click_conv_row(row) -> bool:
-    """osascript 真鼠标点击会话行中心 + 回车强制打开。
-
-    WeCom 在主聊天区显示占位图状态下，**单 click 不会切换 chat panel**。
-    需要 click 选中行后立即按"回车"明确触发"打开聊天"动作。
+    """真鼠标点击：先用 osascript 激活 WeCom，然后 Quartz CGEventPost 全局事件
+    （会移动用户的光标到目标位置再点击）——这是最接近真人操作的方式，能突破
+    WeCom 在某些状态下"模拟 click 无效"的死锁。
     """
     import subprocess
+    import Quartz
     try:
         pos = getattr(row, "AXPosition", None)
         sz  = getattr(row, "AXSize", None)
@@ -2490,27 +2490,40 @@ def _osascript_click_conv_row(row) -> bool:
             return False
         cx = pos[0] + sz[0] / 2
         cy = pos[1] + sz[1] / 2
-        script = f'''
-        tell application "企业微信" to activate
-        delay 0.3
-        tell application "System Events"
-            tell process "企业微信"
-                click at {{{cx:.0f}, {cy:.0f}}}
-                delay 0.15
-                key code 36
-            end tell
-        end tell
-        '''
-        r = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5,
+
+        # 1) 激活 WeCom
+        subprocess.run(
+            ["osascript", "-e", 'tell application "企业微信" to activate'],
+            capture_output=True, timeout=3,
         )
-        if r.returncode == 0:
-            logger.info("osascript activate+click+回车 会话行中心 (%.0f, %.0f)", cx, cy)
-            return True
-        logger.warning("osascript 点击会话行失败 rc=%s err=%s", r.returncode, r.stderr[:120])
+        time.sleep(0.25)
+
+        # 2) Quartz 全局鼠标事件：先 move 光标 → mouseDown → mouseUp
+        #    CGEventPost(kCGHIDEventTap) 走系统硬件事件层，等同物理鼠标
+        pt = Quartz.CGPointMake(cx, cy)
+
+        move = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft,
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
+        time.sleep(0.08)
+
+        down = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventLeftMouseDown, pt, Quartz.kCGMouseButtonLeft,
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        time.sleep(0.05)
+
+        up = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventLeftMouseUp, pt, Quartz.kCGMouseButtonLeft,
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        time.sleep(0.05)
+
+        logger.info("真鼠标 activate+move+click 会话行中心 (%.0f, %.0f)", cx, cy)
+        return True
     except Exception as exc:
-        logger.warning("osascript 点击会话行异常：%s", exc)
+        logger.warning("真鼠标点击会话行异常：%s", exc)
     return False
 
 

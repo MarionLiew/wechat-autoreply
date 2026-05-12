@@ -1605,10 +1605,16 @@ class WeChatWatcher:
         # === 新流程：话术 → 去发送 → 复制话术并跳转 → 确认跳转 → 粘贴发送 ===
 
         # 1) 找话术区下第一个"去发送"按钮（话术 label 之下 y 最小者）
-        send_btn = self._find_first_huashu_send_btn(popup_win)
+        # 按钮渲染是异步的（话术数据加载完才出按钮），加 4s 轮询窗口
+        send_btn = None
+        for _ in range(8):
+            send_btn = self._find_first_huashu_send_btn(popup_win)
+            if send_btn is not None:
+                break
+            time.sleep(0.5)
         if send_btn is None:
             logger.warning(
-                "经营线索：popup 有'话术' label 但未找到下方'去发送'按钮，hash=%s",
+                "经营线索：popup 有'话术' label 但 4s 内未找到下方'去发送'按钮，hash=%s",
                 lead_hash[:12],
             )
             self._processed_leads.add(lead_hash)

@@ -1444,32 +1444,46 @@ class WeChatWatcher:
                         return elem
         return None
 
-    def _handle_jingying_leads(self, conv_row) -> None:
-        """
-        经营线索处理：切换到经营线索聊天 → 找最新未处理线索 → 点击"线索详情>>"
-        → 等待 webview 加载 → 点击"去联系"。
-        """
-        import Quartz
+    # 每轮 _handle_jingying_leads 最多处理多少条 popup 流程的 lead
+    # （文本级快速跳过不计数）。避免一轮卡太久回不到普通客户消息。
+    _LEADS_MAX_PER_TICK = 5
 
-        logger.info("经营线索：开始处理线索…")
-
-        # 切换到经营线索 chat：双管齐下——AX press 静默尝试 + osascript 真鼠标兜底
+    def _switch_to_jingying_conv(self, conv_row) -> bool:
+        """切到经营线索 conv，返回是否切换成功（chat scroll 可见）。"""
         _press_conv_row(conv_row)
         time.sleep(0.5)
-        # 检查切换是否生效（chat scroll area 可见 = 切换成功）
         try:
             window_check = self._get_main_window()
             chat_check = self._find_chat_scroll_area(window_check)
         except Exception:
             chat_check = None
         if chat_check is None:
-            # AX 切换没生效 → 用 osascript 真鼠标点击会话行（会拉前台）
             logger.info("经营线索：AX 切换未生效，用 osascript 真鼠标点击 conv_row")
             _osascript_click_conv_row(conv_row)
             time.sleep(1.0)
+            try:
+                window_check = self._get_main_window()
+                chat_check = self._find_chat_scroll_area(window_check)
+            except Exception:
+                chat_check = None
+        return chat_check is not None
 
-        # 先关闭可能存在的残留 popup（上一轮失败留下的"复制话术..."等弹窗），
-        # 否则 WeCom 可能把它误当成"已打开"，不真正渲染新的线索详情 popup。
+    def _handle_jingying_leads(self, conv_row) -> None:
+        """经营线索处理：切到 conv → 列出所有线索 → 逐条遍历未处理的。
+
+        策略：
+        - **文本级跳过（不进 popup）**：类型不在白名单 / 未加企微 →
+          mark hash，一次扫完整个列表，不浪费 popup 时间。
+        - **需 popup 的 lead**：每轮最多处理 _LEADS_MAX_PER_TICK 条
+          （避免占满 tick 影响普通客户消息），剩下下一轮再来。
+        """
+        logger.info("经营线索：开始处理线索…")
+
+        if not self._switch_to_jingying_conv(conv_row):
+            logger.warning("经营线索：切换 conv 失败，放弃本轮")
+            return
+
+        # 先关闭可能存在的残留 popup（上一轮失败留下的"复制话术..."等弹窗）
         self._close_xiansuo_popups()
         time.sleep(0.5)
 
@@ -1484,59 +1498,109 @@ class WeChatWatcher:
             logger.warning("经营线索：无法获取 WeCom PID")
             return
 
-        # 找聊天消息滚动区
         chat_scroll = self._find_chat_scroll_area(window)
         if chat_scroll is None:
             logger.warning("经营线索：未找到聊天滚动区")
             return
 
-        # 找所有"线索详情>>"链接
         links = self._find_xiansuo_links(chat_scroll)
         logger.info("经营线索：找到 %d 个线索详情链接", len(links))
         if not links:
             return
 
-        # 取最后一条（最新线索），检查是否已处理过
-        lk = links[-1]
-        try:
-            parent_val = str(getattr(lk.AXParent, "AXValue", "") or "")
-        except Exception:
-            parent_val = repr(getattr(lk, "AXPosition", ""))
-        lead_hash = hashlib.sha256(parent_val.encode()).hexdigest()
+        # 倒序遍历（最新在前），分两阶段：
+        # 阶段 1：扫所有 lead，能文本级跳过的直接标记，需 popup 的入队
+        popup_queue: list[tuple[object, str, str, str, str]] = []  # (lk, hash, parent_val, traveler, lead_type)
+        for lk in reversed(links):
+            try:
+                parent_val = str(getattr(lk.AXParent, "AXValue", "") or "")
+            except Exception:
+                continue
+            lead_hash = hashlib.sha256(parent_val.encode()).hexdigest()
+            if lead_hash in self._processed_leads:
+                continue
+            # 类型白名单
+            lead_type = _parse_lead_type(parent_val)
+            if lead_type and lead_type not in LEAD_TYPE_WHITELIST:
+                self._processed_leads.add(lead_hash)
+                logger.info(
+                    "经营线索：类型【%s】不在白名单，跳过（旅客=%s）",
+                    lead_type, _parse_lead_message(parent_val)[0] or "?",
+                )
+                continue
+            traveler, qiwei_nick = _parse_lead_message(parent_val)
+            if qiwei_nick == "":
+                self._processed_leads.add(lead_hash)
+                logger.info(
+                    "经营线索：客户【未添加企微】✗（旅客=%s, 微信昵称为空），跳过",
+                    traveler or "?",
+                )
+                continue
+            popup_queue.append((lk, lead_hash, parent_val, traveler, lead_type or ""))
 
-        if lead_hash in self._processed_leads:
-            logger.info("经营线索：最新线索已处理过，跳过")
+        if not popup_queue:
+            logger.info("经营线索：本轮无需 popup 处理的 lead（全部已跳过或处理过）")
             return
 
-        # 类型白名单过滤——只处理用户指定的线索类型
-        lead_type = _parse_lead_type(parent_val)
-        if lead_type and lead_type not in LEAD_TYPE_WHITELIST:
-            self._processed_leads.add(lead_hash)
-            logger.info(
-                "经营线索：类型【%s】不在白名单，跳过（旅客=%s）",
-                lead_type, _parse_lead_message(parent_val)[0] or "?",
-            )
-            return
-
-        # 根据消息文本里"微信昵称:"字段判断是否已添加企微：
-        # - 已添加：'微信昵称:某某'  → 走开 popup + 点 去联系
-        # - 未添加：'微信昵称:\n'    → 直接跳过，省 ~13s popup 耗时
-        traveler, qiwei_nick = _parse_lead_message(parent_val)
-        if qiwei_nick == "":
-            self._processed_leads.add(lead_hash)
-            logger.info(
-                "经营线索：客户【未添加企微】✗（旅客=%s, 微信昵称为空），跳过",
-                traveler or "?",
-            )
-            return
         logger.info(
-            "经营线索：客户【已添加企微】✓ 类型=【%s】（旅客=%s, 微信昵称=%s）",
-            lead_type or "?", traveler or "?", qiwei_nick,
+            "经营线索：本轮需 popup 处理 %d 条，将处理前 %d 条",
+            len(popup_queue), min(len(popup_queue), self._LEADS_MAX_PER_TICK),
         )
 
-        # 点击"线索详情>>"：双管齐下——先 AXPress 触发 webview 内部 click
-        # （Chromium 链接对 AXPress 最敏感），再 PostToPid 鼠标点 link 真实
-        # 中心兜底。两个都试，无论哪个生效都行。
+        # 阶段 2：依次走 popup 流程（每条之间重切回 经营线索 conv）
+        for idx, (lk, lead_hash, parent_val, traveler, lead_type) in enumerate(popup_queue):
+            if idx >= self._LEADS_MAX_PER_TICK:
+                logger.info(
+                    "经营线索：本轮已 popup 处理 %d 条（上限 %d），剩 %d 条留下一轮",
+                    idx, self._LEADS_MAX_PER_TICK, len(popup_queue) - idx,
+                )
+                break
+            # 第二条起：每条之前重新切回 经营线索 conv（前一条流程可能切走了）
+            if idx > 0:
+                if not self._switch_to_jingying_conv(conv_row):
+                    logger.warning("经营线索：切回 conv 失败，剩余 %d 条放弃", len(popup_queue) - idx)
+                    return
+                self._close_xiansuo_popups()
+                time.sleep(0.5)
+                # 重新找到这个 lead 的最新 AX node（hash 匹配）
+                try:
+                    window = self._get_main_window()
+                    chat_scroll = self._find_chat_scroll_area(window)
+                    if chat_scroll is None:
+                        logger.warning("经营线索：切回后未找到 chat scroll，剩 %d 条放弃", len(popup_queue) - idx)
+                        return
+                    fresh_links = self._find_xiansuo_links(chat_scroll)
+                    new_lk = None
+                    for fl in fresh_links:
+                        try:
+                            pv = str(getattr(fl.AXParent, "AXValue", "") or "")
+                            if hashlib.sha256(pv.encode()).hexdigest() == lead_hash:
+                                new_lk = fl
+                                break
+                        except Exception:
+                            continue
+                    if new_lk is None:
+                        logger.warning(
+                            "经营线索：切回后找不到 hash=%s 对应 link，跳过",
+                            lead_hash[:12],
+                        )
+                        continue
+                    lk = new_lk
+                except Exception as exc:
+                    logger.warning("经营线索：切回准备异常 %s，跳过本条", exc)
+                    continue
+
+            logger.info(
+                "经营线索：客户【已添加企微】✓ 类型=【%s】（旅客=%s, %d/%d）",
+                lead_type or "?", traveler or "?", idx + 1, min(len(popup_queue), self._LEADS_MAX_PER_TICK),
+            )
+            self._process_one_lead_popup(lk, lead_hash, traveler, pid)
+
+    def _process_one_lead_popup(self, lk, lead_hash: str, traveler: str, pid: int) -> None:
+        """单条 lead 的 popup 流程：线索详情→话术→去发送→复制话术并跳转→确认跳转→粘贴发送。"""
+        import Quartz
+
+        # 点击"线索详情>>"
         lk_pos = getattr(lk, "AXPosition", None)
         lk_sz = getattr(lk, "AXSize", None)
 

@@ -2498,29 +2498,31 @@ def _osascript_click_conv_row(row) -> bool:
         )
         time.sleep(0.25)
 
-        # 2) Quartz 全局鼠标事件：先 move 光标 → mouseDown → mouseUp
-        #    CGEventPost(kCGHIDEventTap) 走系统硬件事件层，等同物理鼠标
+        # 2) Quartz 物理级鼠标事件：用 HID source（最难和真鼠标区分）+ ClickState=1
         pt = Quartz.CGPointMake(cx, cy)
+        source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
 
         move = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft,
+            source, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft,
         )
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
-        time.sleep(0.08)
+        time.sleep(0.15)  # hover 150ms 让 WeCom 处理鼠标进入事件
 
         down = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventLeftMouseDown, pt, Quartz.kCGMouseButtonLeft,
+            source, Quartz.kCGEventLeftMouseDown, pt, Quartz.kCGMouseButtonLeft,
         )
+        Quartz.CGEventSetIntegerValueField(down, Quartz.kCGMouseEventClickState, 1)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
-        time.sleep(0.05)
+        time.sleep(0.08)
 
         up = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventLeftMouseUp, pt, Quartz.kCGMouseButtonLeft,
+            source, Quartz.kCGEventLeftMouseUp, pt, Quartz.kCGMouseButtonLeft,
         )
+        Quartz.CGEventSetIntegerValueField(up, Quartz.kCGMouseEventClickState, 1)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
-        time.sleep(0.05)
+        time.sleep(0.1)
 
-        logger.info("真鼠标 activate+move+click 会话行中心 (%.0f, %.0f)", cx, cy)
+        logger.info("HID 物理鼠标 activate+move+click 会话行中心 (%.0f, %.0f)", cx, cy)
         return True
     except Exception as exc:
         logger.warning("真鼠标点击会话行异常：%s", exc)

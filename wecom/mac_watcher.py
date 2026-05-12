@@ -211,6 +211,32 @@ class WeChatWatcher:
             return val
         return ""
 
+    def _wake_up_chat_panel(self) -> None:
+        """主聊天区为空时（chat header=''），点击 conv_list 第一个 row 让 WeCom 唤醒。
+
+        触发条件由调用方决定（通常是连续 verify 失败之后）。
+        副作用：会瞬间拉 WeCom 到前台一次。
+        """
+        try:
+            window = self._get_main_window()
+            conv_list = self._find_conversation_list(window)
+            rows = self._get_conversation_rows(conv_list)
+            if not rows:
+                return
+            # 取前 3 个里第一个可读 sender 的 row（避免点到经营线索/客户联系等特殊行）
+            for row in rows[:5]:
+                try:
+                    for st in _deep_find_all(row, "AXStaticText", max_depth=4):
+                        v = str(getattr(st, "AXValue", "") or "").strip()
+                        if v and v not in ("经营线索", "客户联系", "企业微信团队"):
+                            _osascript_click_conv_row(row)
+                            logger.info("唤醒主聊天区：osascript 点击 row sender=%s", v[:20])
+                            return
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.debug("_wake_up_chat_panel 异常：%s", exc)
+
     def _try_dismiss_covering_panel(self, window) -> bool:
         """尝试关闭遮挡聊天面板的功能浮层（如 '客户经营专区'、'经营大厅'）。
 
@@ -454,6 +480,11 @@ class WeChatWatcher:
                     "[%s] 第 %d 次重试改用 osascript click（拉前台破解死局）",
                     expected_sender, attempt + 1,
                 )
+                # WeCom 可能在工作台/我等其他 tab，主聊天区空。
+                # 先唤醒主区：osascript 点击 conv_list 第一个 row（不管是谁）让 chat panel 活过来
+                if attempt >= 2:
+                    self._wake_up_chat_panel()
+                    time.sleep(0.5)
                 _osascript_click_conv_row(conv_row)
                 pressed = True
             if not pressed:
@@ -2184,11 +2215,12 @@ class WeChatWatcher:
             logger.debug("随机延迟 %.1f 秒后回复", delay)
             time.sleep(delay)
 
-            # 打字风暴检测：delay 期间客户又发了消息 → 放弃本次回复，下轮重新合并
+            # 打字风暴检测：delay 期间客户又发 3+ 条才跳过（之前 1 条就跳过太敏感，
+            # 加上 reply_delay 已缩到 0.5-1.5s，正常打字流不会被误打断）
             new_unread = self._unread_count(msg["conv_row"])
-            if new_unread > unread_n:
+            if new_unread > unread_n + 2:
                 logger.info(
-                    "[%s] delay 期间收到 %d 条新消息，本轮跳过（下轮合并处理）",
+                    "[%s] delay 期间收到 %d 条新消息（>2），本轮跳过（下轮合并处理）",
                     sender, new_unread - unread_n,
                 )
                 continue

@@ -1157,6 +1157,29 @@ class WeChatWatcher:
                 except Exception as exc:
                     logger.debug("sendKeys 回车失败：%s", exc)
 
+            # ④ osascript keystroke return（最后兜底）：通过 System Events 真键盘事件
+            # 经营大厅等功能浮层会吃掉 PostToPid 路由的 Enter，但 osascript keystroke
+            # 是系统级，浮层无法拦截。代价：拉 WeCom 到前台 0.5s。
+            if not enter_method:
+                try:
+                    import subprocess
+                    script = (
+                        'tell application "企业微信" to activate\n'
+                        'delay 0.2\n'
+                        'tell application "System Events" to keystroke return\n'
+                    )
+                    r = subprocess.run(
+                        ["osascript", "-e", script],
+                        capture_output=True, text=True, timeout=4,
+                    )
+                    time.sleep(0.4)
+                    if r.returncode == 0 and _verify_sent():
+                        enter_method = "osascript-keystroke-return"
+                    else:
+                        logger.warning("osascript keystroke return 后输入框仍有文本")
+                except Exception as exc:
+                    logger.debug("osascript keystroke return 失败：%s", exc)
+
             method_label = f"{used_method}+{enter_method}"
             if enter_method:
                 logger.info("已发送回复（方式=%s）：%s", method_label, reply_text[:60])

@@ -1429,10 +1429,20 @@ class WeChatWatcher:
 
         logger.info("经营线索：开始处理线索…")
 
-        if not _press_conv_row(conv_row):
-            logger.warning("经营线索：切换聊天窗口失败")
-            return
-        time.sleep(0.8)
+        # 切换到经营线索 chat：双管齐下——AX press 静默尝试 + osascript 真鼠标兜底
+        _press_conv_row(conv_row)
+        time.sleep(0.5)
+        # 检查切换是否生效（chat scroll area 可见 = 切换成功）
+        try:
+            window_check = self._get_main_window()
+            chat_check = self._find_chat_scroll_area(window_check)
+        except Exception:
+            chat_check = None
+        if chat_check is None:
+            # AX 切换没生效 → 用 osascript 真鼠标点击会话行（会拉前台）
+            logger.info("经营线索：AX 切换未生效，用 osascript 真鼠标点击 conv_row")
+            _osascript_click_conv_row(conv_row)
+            time.sleep(1.0)
 
         # 先关闭可能存在的残留 popup（上一轮失败留下的"复制话术..."等弹窗），
         # 否则 WeCom 可能把它误当成"已打开"，不真正渲染新的线索详情 popup。

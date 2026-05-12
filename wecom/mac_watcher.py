@@ -133,6 +133,23 @@ class WeChatWatcher:
         # 3. 营销/活动模板（生日有礼、🎁 开头活动文案等）
         if t.startswith("🎁") or "生日有礼" in t or "生日赢好礼" in t:
             return True
+        # 4. 客户经理推送的营销邀约：典型组合关键词
+        if "诚邀您参与" in t or "诚邀您报名" in t:
+            return True
+        if "里程延期" in t and ("飞行赠里" in t or "诚邀" in t or "活动" in t):
+            return True
+        if "飞享加赠" in t or "好里相伴" in t or "好“里”相伴" in t:
+            return True
+        if "里程加赠" in t and ("活动" in t or "诚邀" in t):
+            return True
+        # 5. 以 💗/💁/🎁/✈️ 等营销 emoji 开头 + 含"会员/活动"
+        if t[:2] in ("💗", "💁", "✈️", "🎁", "🎉") and (
+            "尊敬的会员" in t or "活动" in t or "里程" in t
+        ):
+            return True
+        # 6. 链接型推送（含"南航 m.csair" 等）
+        if "m.csair.c" in t and ("活动" in t or "会员" in t):
+            return True
         return False
 
     # ------------------------------------------------------------------

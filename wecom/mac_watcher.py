@@ -1445,8 +1445,9 @@ class WeChatWatcher:
         return None
 
     # 每轮 _handle_jingying_leads 最多处理多少条 popup 流程的 lead
-    # （文本级快速跳过不计数）。避免一轮卡太久回不到普通客户消息。
-    _LEADS_MAX_PER_TICK = 5
+    # （文本级快速跳过不计数）。实测>=2 会因切回 conv 后 AX tree 未稳定
+    # 导致 hash 找不到 link，所以保守为 1 条，剩余下一轮经营线索触发时再做。
+    _LEADS_MAX_PER_TICK = 1
 
     def _switch_to_jingying_conv(self, conv_row) -> bool:
         """切到经营线索 conv，返回是否切换成功（chat scroll 可见）。"""
@@ -2055,12 +2056,22 @@ class WeChatWatcher:
         客户，否则 keystroke 会发到错误聊天。
         """
         import subprocess
-        # 用 `tell application activate` 而非 `tell process set frontmost`——
-        # 后者在 AX 子系统紧张时（刚跑完一堆 popup 操作）会卡数十秒；
-        # activate 是 OS LSOpen 级，几乎不会卡。
+        # 激活和 keystroke 分两步：
+        # 1) `open -a` shell 命令拉前台——OS LSOpen 级，不会因为 WeCom 不
+        #    响应 AppleEvent 而 hang（launchd 上下文 `tell application activate`
+        #    会卡到超时）
+        # 2) `tell application "System Events" keystroke ...` 只走系统键盘事件，
+        #    不需要对 WeCom 发 AppleEvent
+        try:
+            subprocess.run(
+                ["open", "-a", "企业微信"],
+                capture_output=True, text=True, timeout=3,
+            )
+            time.sleep(0.5)
+        except Exception as exc:
+            logger.warning("经营线索：open -a 激活异常：%s", exc)
+
         script = (
-            'tell application "企业微信" to activate\n'
-            'delay 0.3\n'
             'tell application "System Events"\n'
             '    keystroke "v" using {command down}\n'
             '    delay 0.6\n'
@@ -2070,7 +2081,7 @@ class WeChatWatcher:
         try:
             r = subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=12,
+                capture_output=True, text=True, timeout=8,
             )
             if r.returncode == 0:
                 logger.info("经营线索：osascript Cmd+V + Enter 完成")

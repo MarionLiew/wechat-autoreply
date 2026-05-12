@@ -50,6 +50,25 @@ _WELCOME_TEMPLATE = re.compile(
     r"关注到您近期有出行计划|您乘坐.{0,20}航班|值机截载时间|提前选座和在线值机|尊敬的会员"
 )
 
+# 具体事实 / 上下文相关短语——含任何一个就不能直接复用（专属于别的客户的上下文）
+_SPECIFIC_FACTS = re.compile(
+    # 航班号：CZ3226 / MU5101 / CA1234 / HU7890 等
+    r"[A-Z]{2}\d{2,5}"
+    # 日期 / 时间 / 时段
+    r"|\d{1,2}月\d{1,2}|\d{1,2}日|\d{1,2}号"
+    r"|\d{1,2}[:：]\d{2}|\d{1,2}点"
+    # 主要城市（航司客户常用出发到达地）
+    r"|北京|上海|广州|深圳|成都|西安|武汉|杭州|南京|重庆"
+    r"|昆明|乌鲁木齐|拉萨|哈尔滨|沈阳|长春|大连|青岛"
+    r"|济南|郑州|长沙|福州|厦门|香港|澳门|台北|台中|海口|三亚"
+    r"|机场|航班|航线|班机|航空"
+    # 上下文相关短语（"刚刚我调了" "您上次..."）
+    r"|刚刚|刚才|上次|之前我|我说的|我发的|我们之前"
+    r"|您之前|您上次|您说的|您发的|那个航班|那个时间"
+    # 数字+单位（金额、里程等）
+    r"|\d+元|\d+块|\d+万|\d+千|\d+里程"
+)
+
 
 def _sanitize_reply(text: str) -> str:
     """删除引用块、保留其他文本。"""
@@ -75,6 +94,8 @@ def _is_safe_for_direct(text: str) -> bool:
     if _NAME_ADDRESSING.search(text):
         return False
     if _WELCOME_TEMPLATE.search(text):
+        return False
+    if _SPECIFIC_FACTS.search(text):
         return False
     return True
 

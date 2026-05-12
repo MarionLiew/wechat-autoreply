@@ -465,34 +465,11 @@ class WeChatWatcher:
                 if fresh is not None:
                     conv_row = fresh
 
-            # 切换会话三档：
-            # 1. PostToPid 鼠标（最静默，正常状态下生效）
-            # 2. AX Press（兜底，会走 AXSelected 但不真切 panel）
-            # 3. 第 2+ 次重试且前面都失败时 → osascript click（会瞬间拉前台但最可靠）
-            pressed = False
-            if pid:
-                pressed = _force_click_conv_row(conv_row, pid)
-            if not pressed:
-                pressed = _press_conv_row(conv_row)
-            # 第 2 次起 + chat header 一直读不到 → 用 osascript 兜底
-            if attempt >= 1:
-                logger.info(
-                    "[%s] 第 %d 次重试改用 osascript click（拉前台破解死局）",
-                    expected_sender, attempt + 1,
-                )
-                # WeCom 可能在工作台/我等其他 tab，主聊天区空。
-                # 先唤醒主区：osascript 点击 conv_list 第一个 row（不管是谁）让 chat panel 活过来
-                if attempt >= 2:
-                    self._wake_up_chat_panel()
-                    time.sleep(0.5)
-                _osascript_click_conv_row(conv_row)
-                pressed = True
-            if not pressed:
-                logger.error("[%s] AX 与鼠标点击都未能切换会话", expected_sender or "?")
-                if attempt + 1 >= attempts:
-                    return False
-                time.sleep(0.5)
-                continue
+            # 切换会话——直接用 osascript activate+click（最可靠），WeCom 在某些
+            # 状态下不响应 PostToPid 静默事件，激活前台后真鼠标点击是确定生效的方式。
+            # 副作用：WeCom 会被瞬间拉前台。
+            _osascript_click_conv_row(conv_row)
+            pressed = True
 
             if not sender_core:
                 time.sleep(1.0)
@@ -2500,11 +2477,9 @@ def _force_click_conv_row(row, pid) -> bool:
 
 
 def _osascript_click_conv_row(row) -> bool:
-    """osascript 鼠标点击会话行中心：会瞬间把 WeCom 调前台再点。
-
-    破解 PostToPid 死局——某些 WeCom 状态下 PostToPid 鼠标不被 Chromium 内部
-    识别（chat panel 不切换）。osascript 走真正的系统级鼠标事件，最可靠。
-    代价：临时把 WeCom 拉到前台（~0.5s）。
+    """osascript 真鼠标点击会话行中心。先用 `tell application 企业微信 to activate`
+    把 WeCom 真激活到前台（比 `set frontmost to true` 更彻底，能突破 WeCom 主
+    聊天区空状态时的 click 死锁），然后通过 System Events 发送 click。
     """
     import subprocess
     try:
@@ -2515,10 +2490,10 @@ def _osascript_click_conv_row(row) -> bool:
         cx = pos[0] + sz[0] / 2
         cy = pos[1] + sz[1] / 2
         script = f'''
+        tell application "企业微信" to activate
+        delay 0.3
         tell application "System Events"
             tell process "企业微信"
-                set frontmost to true
-                delay 0.2
                 click at {{{cx:.0f}, {cy:.0f}}}
             end tell
         end tell
@@ -2528,7 +2503,7 @@ def _osascript_click_conv_row(row) -> bool:
             capture_output=True, text=True, timeout=5,
         )
         if r.returncode == 0:
-            logger.info("osascript 点击会话行中心 (%.0f, %.0f)", cx, cy)
+            logger.info("osascript activate+click 会话行中心 (%.0f, %.0f)", cx, cy)
             return True
         logger.warning("osascript 点击会话行失败 rc=%s err=%s", r.returncode, r.stderr[:120])
     except Exception as exc:

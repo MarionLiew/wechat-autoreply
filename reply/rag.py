@@ -69,6 +69,15 @@ _SPECIFIC_FACTS = re.compile(
     r"|\d+元|\d+块|\d+万|\d+千|\d+里程"
 )
 
+# 完成态承诺——bot 不能直接复用历史回复里这些"已经办好"的句式，
+# 因为 bot 实际没有操作系统，会撒谎/误导客户。
+_COMPLETION_CLAIM = re.compile(
+    r"搞定了|搞掂|办好了|改好了|选好了|调好了|弄好了|帮您改了|帮您选了|帮您调了|"
+    r"已经.{0,4}(?:好了|安排|搞定|改|选|调|办|处理)|"
+    r"给您(?:改|选|调|办|加|送|领).{0,3}了|"
+    r"成功(?:改|选|调|办|加|送|升|降|累).{0,3}"
+)
+
 
 def _sanitize_reply(text: str) -> str:
     """删除引用块、保留其他文本。"""
@@ -96,6 +105,8 @@ def _is_safe_for_direct(text: str) -> bool:
     if _WELCOME_TEMPLATE.search(text):
         return False
     if _SPECIFIC_FACTS.search(text):
+        return False
+    if _COMPLETION_CLAIM.search(text):
         return False
     return True
 

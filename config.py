@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # 在 .env 里用英文逗号分隔：EXCLUDED_SENDERS=经营线索,客户联系,邮件提醒
     excluded_senders: str = "经营线索,客户联系,邮件提醒,企业微信团队,文件传输助手,明珠智企"
 
+    # ── 每日邮件报表 ─────────────────────────────────────────
+    # 每日 0 点把"昨日"汇总（回复/失败/线索条数）通过 SMTP 发到目标邮箱
+    daily_report_enabled: bool = False  # 总开关
+    smtp_host: str = "smtp.qq.com"
+    smtp_port: int = 465                # QQ 用 SSL
+    smtp_user: str = ""                 # 发件邮箱（如 xxx@qq.com）
+    smtp_password: str = ""             # QQ 的 SMTP 授权码（不是登录密码）
+    smtp_from: str = ""                 # 显示发件人；为空默认用 smtp_user
+    smtp_to: str = ""                   # 收件邮箱
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
@@ -107,3 +117,66 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def validate_startup_config() -> list[str]:
+    """启动期配置校验，返回 warning 列表（空 = 一切正常）。
+
+    严重错误（阻止启动）应抛 RuntimeError；非致命问题打 warning 让 daemon 继续跑。
+    """
+    import logging
+    from pathlib import Path
+    log = logging.getLogger("config.validate")
+    warns: list[str] = []
+
+    # LLM
+    if settings.llm_enabled:
+        if not settings.effective_api_key:
+            raise RuntimeError("LLM_ENABLED=true 但 LLM_API_KEY 为空，请在 .env 配置")
+        valid_providers = {"anthropic", "openai", "moonshot", "zhipu", "qwen", "custom"}
+        if settings.llm_provider not in valid_providers:
+            raise RuntimeError(
+                f"LLM_PROVIDER={settings.llm_provider!r} 不支持，仅支持 {valid_providers}"
+            )
+        if settings.llm_provider == "custom" and not settings.llm_base_url:
+            raise RuntimeError("LLM_PROVIDER=custom 时必须设 LLM_BASE_URL")
+
+    # RAG
+    if settings.rag_enabled:
+        if not settings.rag_manager:
+            raise RuntimeError("RAG_ENABLED=true 但 RAG_MANAGER 为空")
+        idx = Path(__file__).resolve().parent / "data" / "rag_index" / settings.rag_manager
+        emb = idx / "embeddings.npy"
+        meta = idx / "metadata.jsonl"
+        if not emb.exists() or not meta.exists():
+            raise RuntimeError(
+                f"RAG_ENABLED=true 但索引文件不存在：{emb} / {meta}。"
+                "请先运行 scripts/build_rag_index.py"
+            )
+
+    # 邮件
+    if settings.daily_report_enabled:
+        if not settings.smtp_user or not settings.smtp_password or not settings.smtp_to:
+            warns.append(
+                "DAILY_REPORT_ENABLED=true 但 SMTP_USER/SMTP_PASSWORD/SMTP_TO 任一为空，"
+                "邮件无法发出"
+            )
+
+    # WeCom bundle id 可解析（osascript 试一下）
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["osascript", "-e", f'id of app id "{settings.wecom_bundle_id}"'],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0:
+            warns.append(
+                f"WECOM_BUNDLE_ID={settings.wecom_bundle_id} 系统找不到对应 App，"
+                "daemon 启动后会报 RuntimeError。请确认企业微信已安装。"
+            )
+    except Exception as exc:
+        warns.append(f"WeCom bundle id 校验失败：{exc}")
+
+    for w in warns:
+        log.warning("⚠ %s", w)
+    return warns

@@ -35,7 +35,8 @@ except ImportError:
 
 from config import settings
 from reply import engine
-from storage import leads_log, message_log
+from storage import leads_log, mailer, message_log
+from storage.daily_stats import DailyTracker
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,10 @@ class WeChatWatcher:
             logger.info("已恢复 %d 条已处理线索哈希（防重发）", len(self._processed_leads))
         # 优雅退出标志：SIGTERM/SIGINT 设置后，循环结束当前 tick 即退
         self._should_stop = False
+        # 每日统计：每 tick 末检查跨日 → 发邮件 + 重置
+        self._daily = DailyTracker()
+        # WeCom 应用获取失败计数：连续 N 次后用 `open -a` 自愈
+        self._app_fail_streak = 0
 
     def request_stop(self) -> None:
         """从外部（信号处理器）请求优雅退出。当前 tick 完成后退出。"""
@@ -123,15 +128,37 @@ class WeChatWatcher:
     # ------------------------------------------------------------------
 
     def _get_app(self):
-        """获取企业微信 App 引用，不在运行时抛出 RuntimeError。"""
+        """获取企业微信 App 引用，连续 3 次失败时自动 `open -a` 拉起，再失败才抛错。"""
         if self._app is None:
             try:
                 self._app = atomacos.getAppRefByBundleId(settings.wecom_bundle_id)
+                self._app_fail_streak = 0
             except Exception as exc:
-                raise RuntimeError(
-                    f"找不到企业微信（bundle_id={settings.wecom_bundle_id}），"
-                    "请确认 App 已启动。"
-                ) from exc
+                self._app_fail_streak += 1
+                if self._app_fail_streak >= 3:
+                    logger.warning(
+                        "连续 %d 次找不到企业微信，尝试 `open -a 企业微信` 自愈",
+                        self._app_fail_streak,
+                    )
+                    try:
+                        import subprocess
+                        subprocess.run(
+                            ["open", "-a", "企业微信"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        time.sleep(4.0)  # 等 WeCom 启动 + AX tree 就绪
+                        self._app = atomacos.getAppRefByBundleId(settings.wecom_bundle_id)
+                        self._app_fail_streak = 0
+                        logger.info("自愈成功：企业微信已重新拉起")
+                    except Exception as exc2:
+                        raise RuntimeError(
+                            f"自愈失败，仍然找不到企业微信（bundle_id={settings.wecom_bundle_id}）"
+                        ) from exc2
+                else:
+                    raise RuntimeError(
+                        f"找不到企业微信（bundle_id={settings.wecom_bundle_id}），"
+                        "请确认 App 已启动。"
+                    ) from exc
         return self._app
 
     def _get_main_window(self):
@@ -1625,6 +1652,7 @@ class WeChatWatcher:
         # 5) Cmd+V 粘贴 + Enter 发送
         if self._paste_and_send_in_chat(pid):
             leads_log.record_lead_sent(traveler, lead_hash)
+            self._daily.record_lead()
             today_count = leads_log.count_today()
             logger.info(
                 "经营线索：✅ 全流程完成 旅客=%s hash=%s 话术已发送 📊 今日累计 %d 条",
@@ -2292,6 +2320,7 @@ class WeChatWatcher:
             )
             latency_ms = int((time.monotonic() - t_start) * 1000)
             if sent:
+                self._daily.record_reply(result.get("source") or "")
                 self._processed.add(msg["msg_hash"])
                 # 内容级去重：记录本次回复的消息集合，下次见到相同集合直接跳过
                 self._last_replied_batch[sender] = content_batch
@@ -2313,6 +2342,8 @@ class WeChatWatcher:
                     send_method=used_method,
                     latency_ms=latency_ms,
                 )
+            else:
+                self._daily.record_failure()
 
     def run(self) -> None:
         """启动轮询守护循环。SIGTERM/SIGINT 后会在当前 tick 完成后优雅退出。"""
@@ -2329,6 +2360,14 @@ class WeChatWatcher:
                 logger.error("轮询异常：%s", exc)
             # 心跳：外部健康检查（cron / launchd watchdog）看 mtime 即可
             _touch_heartbeat()
+            # 跨日检查：发昨日报表邮件（若启用）
+            prev_day = self._daily.rollover_if_new_day()
+            if prev_day is not None:
+                logger.info("📅 跨日：%s 报表正在出炉", prev_day.date)
+                logger.info("\n%s", prev_day.to_text())
+                if settings.daily_report_enabled:
+                    subject = f"[WeCom 日报] {prev_day.date}：回复 {prev_day.replied} / 线索 {prev_day.leads_processed}"
+                    mailer.send_mail(subject, prev_day.to_text())
             # 每 6 个 tick（~30s）持久化一次 processed_leads（小开销）
             last_leads_save += 1
             if last_leads_save >= 6:

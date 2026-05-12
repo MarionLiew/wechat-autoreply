@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from config import settings
+from config import settings, validate_startup_config
 from wecom.mac_watcher import WeChatWatcher
 
 # ── 日志配置：文件轮转 + 控制台 ────────────────────────────────────
@@ -61,6 +61,13 @@ def _install_signal_handlers(watcher: WeChatWatcher, logger: logging.Logger) -> 
 if __name__ == "__main__":
     import time
     logger = logging.getLogger("run")
+
+    # 启动期配置校验：致命错误直接退出 + launchd 会看到 ExitCode，便于排查
+    try:
+        validate_startup_config()
+    except RuntimeError as exc:
+        logger.error("配置校验失败，终止启动：%s", exc)
+        sys.exit(1)
 
     # 崩溃自拉起：捕获任何未处理异常后等几秒重启
     backoff = 3

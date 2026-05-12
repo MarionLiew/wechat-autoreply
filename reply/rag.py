@@ -1,0 +1,213 @@
+"""RAG 检索层：从客户经理聊天记录里检索最相似的历史 QA 对。
+
+数据布局：
+    data/rag_index/<manager>/
+      embeddings.npy   (N, dim) float32, 已 L2 normalized
+      metadata.jsonl   N 行 {q, a, customer, ts}
+
+运行时：
+    rag = RagRetriever(manager="罗响")
+    hits = rag.search(query="罗经理麻烦帮我选个第一排", k=3)
+    # hits = [{q, a, customer, ts, score, safe_for_direct}, ...]
+    # safe_for_direct=True 才能直接复用 a 作回复（无客户姓名泄漏）
+
+懒加载——首次 .search() 时才载入模型 + 索引；后续复用。
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+
+MODEL_NAME = "maidalun1020/bce-embedding-base_v1"
+
+# 模型只载入一次，跨 manager 共享
+_model = None
+
+
+# ── 历史回复清洗 + 安全性判定 ──────────────────────────────────────
+# A 路径要直接复用 hist_a 时，必须不含其他客户的特定信息。
+
+# 删除 WeCom 引用/回复消息块（多行块，以 "这是一条引用/回复消息：" 开头到 "------" 结束）
+_QUOTE_BLOCK = re.compile(
+    r"这是一条引用/回复消息.*?------",
+    flags=re.DOTALL,
+)
+
+# 含具体客户称呼的句式：1-5 字（中文名/英文名/拼音）后跟称谓
+# 例：'亮哥', '龙哥', '刘先生', '王总', 'Mike哥', '亮亮姐'
+# 注意：不限定后续语境，因为'好的亮哥'、'好的龙哥'、'我帮您看看龙哥'都需识别
+_NAME_ADDRESSING = re.compile(
+    r"(?:[一-鿿]|[A-Za-z]){1,5}(先生|女士|小姐|哥|姐|爷|总|老师|博士|教授)"
+)
+
+# 客户经理欢迎语模板（应该被滤掉）
+_WELCOME_TEMPLATE = re.compile(
+    r"关注到您近期有出行计划|您乘坐.{0,20}航班|值机截载时间|提前选座和在线值机|尊敬的会员"
+)
+
+
+def _sanitize_reply(text: str) -> str:
+    """删除引用块、保留其他文本。"""
+    if not text:
+        return ""
+    text = _QUOTE_BLOCK.sub("", text)
+    # 多个空行合并
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _is_safe_for_direct(text: str) -> bool:
+    """判断清洗后的回复是否安全可直接复用。
+
+    不安全条件（任一即否）：
+    1. 包含具体客户称呼（"亮哥"、"刘先生您好"等）
+    2. 包含欢迎模板（"关注到您近期有出行"）
+    3. 太长（> 80 字）——直接复用长回复风险高
+    4. 太短（< 1 字）——空内容
+    """
+    if not text or len(text) > 80 or len(text) < 1:
+        return False
+    if _NAME_ADDRESSING.search(text):
+        return False
+    if _WELCOME_TEMPLATE.search(text):
+        return False
+    return True
+
+
+def _clean_name(raw: str) -> str:
+    """从 sender_id 抽干净人名：去性别括号 + ID 后缀 + 表情等。"""
+    if not raw:
+        return ""
+    return raw.split("(")[0].split("（")[0].split("-")[0].strip()
+
+
+def substitute_customer_name(text: str, hist_customer: str, current_customer: str) -> tuple[str, bool]:
+    """把回复里的历史客户名换成当前客户名。
+
+    例：
+      text='好的亮哥', hist_customer='亮', current_customer='周斌'
+      → ('好的斌哥', True)   ← 取当前客户姓名末字
+    """
+    if not text or not hist_customer or not current_customer:
+        return text, False
+    h = _clean_name(hist_customer)
+    if not h or h not in text:
+        return text, False
+    c = _clean_name(current_customer)
+    if not c:
+        return text, False
+    new_addr = c[-1] if len(c) > 1 else c
+    return text.replace(h, new_addr), True
+
+
+def is_safe_after_substitution(text: str, current_customer: str) -> bool:
+    """替换历史人名为当前客户名后的安全检查。
+
+    允许 X哥/X姐/X先生 等，只要 X 是当前客户名的字。
+    """
+    if not text or len(text) > 80:
+        return False
+    if _WELCOME_TEMPLATE.search(text):
+        return False
+    name = _clean_name(current_customer)
+    if not name:
+        # 没有当前客户名 → 不能验证，保守不允许
+        return not _NAME_ADDRESSING.search(text)
+    name_chars = set(name)
+    # 所有 X哥/X姐 形式里，X 必须含当前客户名字符
+    for m in _NAME_ADDRESSING.finditer(text):
+        x_full = m.group(0)
+        title = m.group(1)
+        x_name = x_full[:-len(title)]
+        # x_name 至少有一个字符在当前客户名字符集里才视为安全
+        if not any(c in name_chars for c in x_name):
+            return False
+    return True
+
+
+def _get_model():
+    global _model
+    if _model is None:
+        # 延迟 import：让没用 RAG 的场景不付 200MB 包导入成本
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer(MODEL_NAME)
+    return _model
+
+
+class RagRetriever:
+    def __init__(self, manager: str, base_dir: Path | str = "data/rag_index"):
+        self.manager = manager
+        self.base = Path(base_dir) / manager
+        self._embeddings: Optional[np.ndarray] = None
+        self._meta: Optional[list[dict]] = None
+
+    def _load(self):
+        if self._embeddings is not None:
+            return
+        emb_path = self.base / "embeddings.npy"
+        meta_path = self.base / "metadata.jsonl"
+        if not emb_path.exists() or not meta_path.exists():
+            raise FileNotFoundError(
+                f"RAG 索引未找到: {emb_path} / {meta_path}。"
+                "请先运行 scripts/build_rag_index.py 构建。"
+            )
+        self._embeddings = np.load(emb_path)
+        with meta_path.open(encoding="utf-8") as f:
+            self._meta = [json.loads(line) for line in f]
+        if len(self._meta) != self._embeddings.shape[0]:
+            raise ValueError(
+                f"索引不一致: {self._embeddings.shape[0]} vectors vs {len(self._meta)} metadata"
+            )
+
+    def search(self, query: str, k: int = 3, min_score: float = 0.5) -> list[dict]:
+        """检索 top-k 最相似 QA 对。score 是 cosine（normalized dot），范围 [-1,1]。
+
+        min_score 过滤：太低分（不相关）的不返回，调用方可据此决定是否走 LLM 兜底。
+        """
+        self._load()
+        model = _get_model()
+        q_emb = model.encode(
+            [query],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )[0].astype(np.float32)
+        # cosine = dot（都已 L2 normalized）
+        scores = self._embeddings @ q_emb  # shape (N,)
+        # 取 top-k
+        if k >= len(scores):
+            idx = np.argsort(-scores)
+        else:
+            idx = np.argpartition(-scores, k)[:k]
+            idx = idx[np.argsort(-scores[idx])]
+        hits = []
+        for i in idx[:k]:
+            s = float(scores[i])
+            if s < min_score:
+                continue
+            m = self._meta[i]
+            cleaned_a = _sanitize_reply(m["a"])
+            hits.append({
+                "q": m["q"],
+                "a": cleaned_a,                                 # 清洗后的回复（去引用块）
+                "a_raw": m["a"],                                # 原始回复（few-shot 用）
+                "customer": m.get("customer", ""),
+                "ts": m.get("ts", ""),
+                "score": s,
+                "safe_for_direct": _is_safe_for_direct(cleaned_a),
+            })
+        return hits
+
+
+# 单例缓存——按 manager 复用
+_retrievers: dict[str, RagRetriever] = {}
+
+
+def get_retriever(manager: str) -> RagRetriever:
+    if manager not in _retrievers:
+        _retrievers[manager] = RagRetriever(manager)
+    return _retrievers[manager]

@@ -48,6 +48,18 @@ class Settings(BaseSettings):
     # 超过此窗口后，对方若真发相同文本会被正常处理。
     echo_protect_seconds: float = 120.0
 
+    # ── RAG（按客户经理蒸馏的话术库） ─────────────────────────
+    # 总开关；为 True 时 engine 在 rules 之后插入 RAG 层
+    rag_enabled: bool = False
+    # 用哪位客户经理的话术风格回复（必须存在 data/rag_index/<rag_manager>/）
+    rag_manager: str = "罗响"
+    # top-1 score ≥ 此阈值 → 直接复用历史回复（A 路径）
+    rag_direct_threshold: float = 0.85
+    # top-1 score ≥ 此阈值 → 走 few-shot 增强 LLM（B 路径）；低于则跳过 RAG
+    rag_fewshot_threshold: float = 0.55
+    # few-shot 示例条数
+    rag_topk: int = 3
+
     # ── 排除名单 ─────────────────────────────────────────────
     # 会话名字包含任一关键词（大小写不敏感）将被跳过，不回复。
     # 在 .env 里用英文逗号分隔：EXCLUDED_SENDERS=经营线索,客户联系,邮件提醒

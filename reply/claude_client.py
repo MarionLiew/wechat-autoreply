@@ -57,10 +57,57 @@ def reset_client() -> None:
     _client = None
 
 
+def _extract_customer_name(sender_id: str | None) -> str:
+    """从 sender_id（如 '周斌(男)-1234'）抽取干净的客户名 '周斌'。"""
+    if not sender_id:
+        return ""
+    # 去性别括号、数字 ID 后缀
+    name = sender_id.split("(")[0].split("（")[0].split("-")[0].strip()
+    return name
+
+
+def _build_system_prompt(
+    few_shot: list[dict] | None,
+    customer_name: str | None = None,
+) -> str:
+    """系统提示：基础 prompt + 可选的 RAG few-shot 示例（注入风格） + 当前客户名提示。"""
+    base = settings.system_prompt
+    extras = []
+
+    if customer_name:
+        clean_name = _extract_customer_name(customer_name)
+        if clean_name:
+            extras.append(
+                f"当前正在对话的客户姓名是「{clean_name}」。如使用'X哥/X姐/X先生/X女士'等称呼时，"
+                "必须用「{clean_name}」中的字（通常取末字，单字名取全名），不要照搬示例里的其他人名。".format(
+                    clean_name=clean_name
+                )
+            )
+
+    if few_shot:
+        extras.append(
+            "请参考以下「该客户经理过往真实对话」的风格回复——口吻、长度、emoji 使用习惯都要贴近示例。"
+            "注意：示例里的人名（'X哥/X姐'等）只是历史对话客户，不要直接复用，要按上面规则用当前客户的名字。"
+        )
+        for i, ex in enumerate(few_shot, 1):
+            q = (ex.get("q") or "").strip()
+            # few-shot 用原始 a（含历史客户名，给 LLM 看完整风格）
+            a = (ex.get("a_raw") or ex.get("a") or "").strip()
+            if not q or not a:
+                continue
+            extras.append(f"\n示例 {i}:\n客户：{q}\n客户经理：{a}")
+
+    if not extras:
+        return base
+    return base + "\n\n" + "\n\n".join(extras)
+
+
 def generate(
     message: str,
     context: list[str] | None = None,
     history: list[dict] | None = None,
+    few_shot: list[dict] | None = None,
+    customer_name: str | None = None,
 ) -> str | None:
     """
     调用大模型生成回复。
@@ -69,6 +116,8 @@ def generate(
     context: 本轮客户的逐条消息列表，用于 LLM 在单 user 消息里看清分隔
     history: 此客户的历史对话 list[{"role":"user"|"assistant","content":"..."}]
              — 按时间升序排列，不含本轮 message
+    few_shot: RAG 检索到的同位客户经理过往 QA 样本 list[{"q":..., "a":...}]
+             — 仅用于风格示范，注入到 system prompt 里
     """
     if not settings.llm_enabled:
         return None
@@ -79,6 +128,7 @@ def generate(
         provider = settings.llm_provider
         model = settings.effective_model
         client = _get_client()
+        system_prompt = _build_system_prompt(few_shot, customer_name)
 
         # 若 context 比 message 更细致，用分条形式替换 message
         if context and len(context) > 1:
@@ -98,7 +148,7 @@ def generate(
             response = client.messages.create(
                 model=model,
                 max_tokens=1024,
-                system=settings.system_prompt,
+                system=system_prompt,
                 messages=msgs_array,
             )
             return response.content[0].text
@@ -107,7 +157,7 @@ def generate(
                 model=model,
                 max_tokens=1024,
                 messages=[
-                    {"role": "system", "content": settings.system_prompt},
+                    {"role": "system", "content": system_prompt},
                     *msgs_array,
                 ],
             )

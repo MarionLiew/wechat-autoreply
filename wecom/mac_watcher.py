@@ -463,6 +463,17 @@ class WeChatWatcher:
         """
         sender_core = expected_sender.split("(")[0].strip() if expected_sender else ""
 
+        # 短路优化：如果当前 chat panel 已经是目标 sender，直接返回成功，
+        # 跳过 osascript click（不抢前台、省 5-10s）
+        if sender_core:
+            try:
+                cur = self._active_chat_sender(self._get_main_window())
+                if cur and (cur == sender_core or sender_core in cur or cur in sender_core):
+                    logger.info("[%s] 已在目标 chat，无需切换", expected_sender)
+                    return True
+            except Exception:
+                pass
+
         # 检测到这种"非目标"的全局 desc 时，认定有功能浮层遮挡，先折叠再重试
         def _all_descs(window) -> list[str]:
             out = []

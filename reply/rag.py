@@ -86,12 +86,15 @@ def _clean_name(raw: str) -> str:
     return raw.split("(")[0].split("（")[0].split("-")[0].strip()
 
 
-def substitute_customer_name(text: str, hist_customer: str, current_customer: str) -> tuple[str, bool]:
-    """把回复里的历史客户名换成当前客户名。
+_SURNAME_SUFFIXES = ("先生", "女士", "小姐", "太太", "夫人")
+_NICKNAME_SUFFIXES = ("哥", "姐", "总", "爷", "老板", "老师", "经理", "博士", "教授")
 
-    例：
-      text='好的亮哥', hist_customer='亮', current_customer='周斌'
-      → ('好的斌哥', True)   ← 取当前客户姓名末字
+
+def substitute_customer_name(text: str, hist_customer: str, current_customer: str) -> tuple[str, bool]:
+    """把回复里的历史客户名换成当前客户名，遵循中文称谓习惯：
+    - 后跟"先生/女士/小姐"等 → 用姓（current_customer 首字）→ '刘先生'
+    - 后跟"哥/姐/总/爷"等 → 用名末字（current_customer 末字）→ '斌哥'
+    - 其他（如直接呼名） → 用末字
     """
     if not text or not hist_customer or not current_customer:
         return text, False
@@ -101,8 +104,42 @@ def substitute_customer_name(text: str, hist_customer: str, current_customer: st
     c = _clean_name(current_customer)
     if not c:
         return text, False
-    new_addr = c[-1] if len(c) > 1 else c
-    return text.replace(h, new_addr), True
+
+    # 中文客户：按 姓/末字 规则替换。英文/拼音客户：用完整名字替换、连带把后续称谓后缀一并吃掉。
+    has_chinese = any("一" <= ch <= "鿿" for ch in c)
+    first_char = c[0]
+    last_char = c[-1] if len(c) > 1 else c
+
+    parts = []
+    i = 0
+    changed = False
+    while i < len(text):
+        idx = text.find(h, i)
+        if idx == -1:
+            parts.append(text[i:])
+            break
+        suffix_zone = text[idx + len(h):idx + len(h) + 4]
+        if has_chinese:
+            if suffix_zone.startswith(_SURNAME_SUFFIXES):
+                new_addr = first_char
+            elif suffix_zone.startswith(_NICKNAME_SUFFIXES):
+                new_addr = last_char
+            else:
+                new_addr = last_char
+            consume_extra = 0
+        else:
+            # 英文/拼音：直接整名替换，且把紧跟的中文称谓后缀（哥/姐/先生/...）也吃掉
+            new_addr = c
+            consume_extra = 0
+            for suf in _SURNAME_SUFFIXES + _NICKNAME_SUFFIXES:
+                if suffix_zone.startswith(suf):
+                    consume_extra = len(suf)
+                    break
+        parts.append(text[i:idx])
+        parts.append(new_addr)
+        i = idx + len(h) + consume_extra
+        changed = True
+    return "".join(parts), changed
 
 
 def is_safe_after_substitution(text: str, current_customer: str) -> bool:

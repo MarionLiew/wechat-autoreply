@@ -77,12 +77,27 @@ def _build_system_prompt(
     if customer_name:
         clean_name = _extract_customer_name(customer_name)
         if clean_name:
-            extras.append(
-                f"当前正在对话的客户姓名是「{clean_name}」。如使用'X哥/X姐/X先生/X女士'等称呼时，"
-                "必须用「{clean_name}」中的字（通常取末字，单字名取全名），不要照搬示例里的其他人名。".format(
-                    clean_name=clean_name
+            # 判断是中文名还是英文/拉丁名
+            has_chinese = any("一" <= ch <= "鿿" for ch in clean_name)
+            if has_chinese:
+                first = clean_name[0]
+                last = clean_name[-1] if len(clean_name) > 1 else clean_name
+                extras.append(
+                    f"当前正在对话的客户全名是「{clean_name}」。称呼时严格遵循以下规则：\n"
+                    f"- 「X先生/X女士/X小姐」用客户的姓 → 「{first}先生 / {first}女士」\n"
+                    f"- 「X哥/X姐/X总/X爷」用客户名末字 → 「{last}哥 / {last}姐」\n"
+                    f"- 直接呼名也用末字「{last}」\n"
+                    "禁止使用示例里的其他人名（那是过往客户）。"
                 )
-            )
+            else:
+                # 英文/拼音名：直接用完整名字，绝不要拆字加哥/姐（会得到 "a哥" 这种荒谬称呼）
+                extras.append(
+                    f"当前正在对话的客户名是「{clean_name}」（英文/拼音名）。称呼时严格遵循：\n"
+                    f"- 直接喊「{clean_name}」即可，比如「{clean_name}，最近怎么样」「好嘞{clean_name}」\n"
+                    f"- 绝对禁止拆字加'哥/姐'：不能用「{clean_name[-1]}哥」「{clean_name[0]}先生」等\n"
+                    f"- 也可以不带名字，直接说「您」「咱们」\n"
+                    "禁止使用示例里的其他人名（那是过往中文客户的称呼）。"
+                )
 
     if few_shot:
         extras.append(

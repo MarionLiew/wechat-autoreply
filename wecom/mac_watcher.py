@@ -2055,21 +2055,22 @@ class WeChatWatcher:
         客户，否则 keystroke 会发到错误聊天。
         """
         import subprocess
+        # 用 `tell application activate` 而非 `tell process set frontmost`——
+        # 后者在 AX 子系统紧张时（刚跑完一堆 popup 操作）会卡数十秒；
+        # activate 是 OS LSOpen 级，几乎不会卡。
         script = (
+            'tell application "企业微信" to activate\n'
+            'delay 0.3\n'
             'tell application "System Events"\n'
-            '    tell process "企业微信"\n'
-            '        set frontmost to true\n'
-            '        delay 0.5\n'
-            '        keystroke "v" using {command down}\n'
-            '        delay 0.6\n'
-            '        keystroke return\n'
-            '    end tell\n'
+            '    keystroke "v" using {command down}\n'
+            '    delay 0.6\n'
+            '    keystroke return\n'
             'end tell\n'
         )
         try:
             r = subprocess.run(
                 ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=8,
+                capture_output=True, text=True, timeout=12,
             )
             if r.returncode == 0:
                 logger.info("经营线索：osascript Cmd+V + Enter 完成")

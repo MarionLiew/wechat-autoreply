@@ -47,18 +47,23 @@ _HEARTBEAT_PATH = _STORAGE_DIR / "heartbeat.txt"
 _PROCESSED_LEADS_MAX = 5000  # 上限，超出 FIFO 截断
 
 
-def _load_processed_leads() -> set[str]:
+def _load_processed_leads() -> tuple[set[str], set[str]]:
+    """读 (full_hashes, prefixes_12char) 两个集合。
+
+    prefixes 来源：历史 daemon.log 扒到的"✅ 全流程完成"事件里只有 hash 前 12
+    字符（持久化机制晚于这些成功事件），所以用前缀兜底判重。
+    """
     if not _PROCESSED_LEADS_PATH.exists():
-        return set()
+        return set(), set()
     try:
         data = json.loads(_PROCESSED_LEADS_PATH.read_text(encoding="utf-8"))
-        return set(data.get("hashes", []))
+        return set(data.get("hashes", [])), set(data.get("prefixes", []))
     except Exception as exc:
         logger.warning("加载 processed_leads.json 失败：%s", exc)
-        return set()
+        return set(), set()
 
 
-def _save_processed_leads(hashes: set[str]) -> None:
+def _save_processed_leads(hashes: set[str], prefixes: set[str] | None = None) -> None:
     try:
         _STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         items = list(hashes)
@@ -66,6 +71,7 @@ def _save_processed_leads(hashes: set[str]) -> None:
             items = items[-_PROCESSED_LEADS_MAX:]
         data = {
             "hashes": items,
+            "prefixes": sorted(prefixes or []),
             "updated": datetime.now().isoformat(timespec="seconds"),
         }
         _PROCESSED_LEADS_PATH.write_text(
@@ -108,10 +114,15 @@ class WeChatWatcher:
         # 不会因 sender 暂时离开未读列表而被清除，防止同批次消息被多次回复。
         # 只有当新批次消息集合与上次不同时，才触发回复。
         self._last_replied_batch: dict[str, frozenset] = {}
-        # 经营线索：已处理过的线索哈希（旅客文本 hash），从磁盘恢复，跨重启
-        self._processed_leads: set[str] = _load_processed_leads()
-        if self._processed_leads:
-            logger.info("已恢复 %d 条已处理线索哈希（防重发）", len(self._processed_leads))
+        # 经营线索：已处理过的线索哈希 + 历史前 12 字符前缀（防 14:40 王淼彬式重发）
+        full, prefixes = _load_processed_leads()
+        self._processed_leads: set[str] = full
+        self._processed_lead_prefixes: set[str] = prefixes
+        if self._processed_leads or self._processed_lead_prefixes:
+            logger.info(
+                "已恢复 %d 条已处理线索 hash + %d 条前缀（防重发）",
+                len(self._processed_leads), len(self._processed_lead_prefixes),
+            )
         # 优雅退出标志：SIGTERM/SIGINT 设置后，循环结束当前 tick 即退
         self._should_stop = False
         # 每日统计：每 tick 末检查跨日 → 发邮件 + 重置
@@ -122,6 +133,12 @@ class WeChatWatcher:
     def request_stop(self) -> None:
         """从外部（信号处理器）请求优雅退出。当前 tick 完成后退出。"""
         self._should_stop = True
+
+    def _lead_already_processed(self, lead_hash: str) -> bool:
+        """判重：同时查全 hash 集 + 12 字符前缀集（历史日志扒来的）。"""
+        if lead_hash in self._processed_leads:
+            return True
+        return lead_hash[:12] in self._processed_lead_prefixes
 
     # ------------------------------------------------------------------
     # App / Window helpers
@@ -1518,7 +1535,7 @@ class WeChatWatcher:
             except Exception:
                 continue
             lead_hash = hashlib.sha256(parent_val.encode()).hexdigest()
-            if lead_hash in self._processed_leads:
+            if self._lead_already_processed(lead_hash):
                 continue
             # 类型白名单
             lead_type = _parse_lead_type(parent_val)
@@ -2455,7 +2472,7 @@ class WeChatWatcher:
             # 每 6 个 tick（~30s）持久化一次 processed_leads（小开销）
             last_leads_save += 1
             if last_leads_save >= 6:
-                _save_processed_leads(self._processed_leads)
+                _save_processed_leads(self._processed_leads, self._processed_lead_prefixes)
                 last_leads_save = 0
             # 切片睡眠：响应优雅退出更快，最多多睡 0.5s
             slept = 0.0
@@ -2463,7 +2480,7 @@ class WeChatWatcher:
                 time.sleep(0.5)
                 slept += 0.5
         # 退出前最后一次保存
-        _save_processed_leads(self._processed_leads)
+        _save_processed_leads(self._processed_leads, self._processed_lead_prefixes)
         logger.info("WeCom Mac Watcher 收到退出信号，已优雅退出")
 
 

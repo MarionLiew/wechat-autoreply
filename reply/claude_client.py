@@ -11,6 +11,7 @@ LLM 客户端：支持多 provider，统一接口。
 """
 
 import logging
+import time
 
 from config import settings
 
@@ -159,24 +160,41 @@ def generate(
                     msgs_array.append({"role": role, "content": content})
         msgs_array.append({"role": "user", "content": message})
 
-        if provider == "anthropic":
-            response = client.messages.create(
-                model=model,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=msgs_array,
-            )
-            return response.content[0].text
-        else:
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=1024,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    *msgs_array,
-                ],
-            )
-            return response.choices[0].message.content
+        # 429（过载）瞬时错误：最多重试 2 次，指数退避 1.5s / 3s
+        last_exc = None
+        for attempt in range(3):
+            try:
+                if provider == "anthropic":
+                    response = client.messages.create(
+                        model=model,
+                        max_tokens=1024,
+                        system=system_prompt,
+                        messages=msgs_array,
+                    )
+                    return response.content[0].text
+                else:
+                    response = client.chat.completions.create(
+                        model=model,
+                        max_tokens=1024,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            *msgs_array,
+                        ],
+                    )
+                    return response.choices[0].message.content
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                # 仅对 429 / overloaded / rate limit 重试，其他错误立即抛
+                if "429" not in msg and "overload" not in msg.lower() and "rate" not in msg.lower():
+                    raise
+                if attempt < 2:
+                    wait = 1.5 * (attempt + 1)
+                    logger.warning("LLM 429/过载（attempt=%d），%.1fs 后重试：%s",
+                                   attempt + 1, wait, msg[:200])
+                    time.sleep(wait)
+        # 三次都 429
+        raise last_exc
 
     except Exception as exc:
         logger.error("LLM 调用失败（provider=%s）：%s", settings.llm_provider, exc)

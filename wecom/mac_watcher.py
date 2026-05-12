@@ -47,23 +47,32 @@ _HEARTBEAT_PATH = _STORAGE_DIR / "heartbeat.txt"
 _PROCESSED_LEADS_MAX = 5000  # 上限，超出 FIFO 截断
 
 
-def _load_processed_leads() -> tuple[set[str], set[str]]:
-    """读 (full_hashes, prefixes_12char) 两个集合。
+def _load_processed_leads() -> tuple[set[str], set[str], set[str]]:
+    """读 (full_hashes, prefixes_12char, traveler_keys) 三个集合。
 
-    prefixes 来源：历史 daemon.log 扒到的"✅ 全流程完成"事件里只有 hash 前 12
-    字符（持久化机制晚于这些成功事件），所以用前缀兜底判重。
+    - hashes:        当前 daemon 写入的全 SHA256 hash
+    - prefixes:      历史 daemon.log 扒到的前 12 字符 hash
+    - traveler_keys: 业务级去重 key（'类型|旅客名'），防 AX 抖动导致 hash 变
     """
     if not _PROCESSED_LEADS_PATH.exists():
-        return set(), set()
+        return set(), set(), set()
     try:
         data = json.loads(_PROCESSED_LEADS_PATH.read_text(encoding="utf-8"))
-        return set(data.get("hashes", [])), set(data.get("prefixes", []))
+        return (
+            set(data.get("hashes", [])),
+            set(data.get("prefixes", [])),
+            set(data.get("traveler_keys", [])),
+        )
     except Exception as exc:
         logger.warning("加载 processed_leads.json 失败：%s", exc)
-        return set(), set()
+        return set(), set(), set()
 
 
-def _save_processed_leads(hashes: set[str], prefixes: set[str] | None = None) -> None:
+def _save_processed_leads(
+    hashes: set[str],
+    prefixes: set[str] | None = None,
+    traveler_keys: set[str] | None = None,
+) -> None:
     try:
         _STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         items = list(hashes)
@@ -72,6 +81,7 @@ def _save_processed_leads(hashes: set[str], prefixes: set[str] | None = None) ->
         data = {
             "hashes": items,
             "prefixes": sorted(prefixes or []),
+            "traveler_keys": sorted(traveler_keys or []),
             "updated": datetime.now().isoformat(timespec="seconds"),
         }
         _PROCESSED_LEADS_PATH.write_text(
@@ -114,14 +124,19 @@ class WeChatWatcher:
         # 不会因 sender 暂时离开未读列表而被清除，防止同批次消息被多次回复。
         # 只有当新批次消息集合与上次不同时，才触发回复。
         self._last_replied_batch: dict[str, frozenset] = {}
-        # 经营线索：已处理过的线索哈希 + 历史前 12 字符前缀（防 14:40 王淼彬式重发）
-        full, prefixes = _load_processed_leads()
+        # 经营线索：已处理过的线索三重 key——hash + 前缀 + (类型,旅客名) 业务级 key
+        # 业务级 key 防 AX parent_val 抖动（空格/相邻元素混入）导致 hash 改变
+        # 仍旧把同一条 lead 重处理。
+        full, prefixes, traveler_keys = _load_processed_leads()
         self._processed_leads: set[str] = full
         self._processed_lead_prefixes: set[str] = prefixes
-        if self._processed_leads or self._processed_lead_prefixes:
+        self._processed_lead_traveler_keys: set[str] = traveler_keys
+        if self._processed_leads or self._processed_lead_prefixes or self._processed_lead_traveler_keys:
             logger.info(
-                "已恢复 %d 条已处理线索 hash + %d 条前缀（防重发）",
-                len(self._processed_leads), len(self._processed_lead_prefixes),
+                "已恢复 %d hash + %d 前缀 + %d traveler-key（防重发）",
+                len(self._processed_leads),
+                len(self._processed_lead_prefixes),
+                len(self._processed_lead_traveler_keys),
             )
         # 优雅退出标志：SIGTERM/SIGINT 设置后，循环结束当前 tick 即退
         self._should_stop = False
@@ -134,11 +149,26 @@ class WeChatWatcher:
         """从外部（信号处理器）请求优雅退出。当前 tick 完成后退出。"""
         self._should_stop = True
 
-    def _lead_already_processed(self, lead_hash: str) -> bool:
-        """判重：同时查全 hash 集 + 12 字符前缀集（历史日志扒来的）。"""
+    def _lead_traveler_key(self, lead_type: str, traveler: str) -> str:
+        return f"{lead_type or '?'}|{traveler or '?'}"
+
+    def _lead_already_processed(
+        self, lead_hash: str, lead_type: str = "", traveler: str = "",
+    ) -> bool:
+        """三重判重：full hash → 前缀 → 业务级 (类型,旅客)。任一命中即已处理。"""
         if lead_hash in self._processed_leads:
             return True
-        return lead_hash[:12] in self._processed_lead_prefixes
+        if lead_hash[:12] in self._processed_lead_prefixes:
+            return True
+        if traveler and self._lead_traveler_key(lead_type, traveler) in self._processed_lead_traveler_keys:
+            return True
+        return False
+
+    def _mark_lead_processed(self, lead_hash: str, lead_type: str = "", traveler: str = "") -> None:
+        """标记线索已处理：同时入 hash 集 和 业务级 key 集。"""
+        self._processed_leads.add(lead_hash)
+        if traveler:
+            self._processed_lead_traveler_keys.add(self._lead_traveler_key(lead_type, traveler))
 
     # ------------------------------------------------------------------
     # App / Window helpers
@@ -1535,20 +1565,22 @@ class WeChatWatcher:
             except Exception:
                 continue
             lead_hash = hashlib.sha256(parent_val.encode()).hexdigest()
-            if self._lead_already_processed(lead_hash):
+            # 类型先解析（用于业务级判重 key 和 logging）
+            lead_type = _parse_lead_type(parent_val)
+            traveler_now = _parse_lead_message(parent_val)[0] or ""
+            if self._lead_already_processed(lead_hash, lead_type, traveler_now):
                 continue
             # 类型白名单
-            lead_type = _parse_lead_type(parent_val)
             if lead_type and lead_type not in LEAD_TYPE_WHITELIST:
-                self._processed_leads.add(lead_hash)
+                self._mark_lead_processed(lead_hash, lead_type, traveler_now)
                 logger.info(
                     "经营线索：类型【%s】不在白名单，跳过（旅客=%s）",
-                    lead_type, _parse_lead_message(parent_val)[0] or "?",
+                    lead_type, traveler_now or "?",
                 )
                 continue
             traveler, qiwei_nick = _parse_lead_message(parent_val)
             if qiwei_nick == "":
-                self._processed_leads.add(lead_hash)
+                self._mark_lead_processed(lead_hash, lead_type, traveler)
                 logger.info(
                     "经营线索：客户【未添加企微】✗（旅客=%s, 微信昵称为空），跳过",
                     traveler or "?",
@@ -1612,9 +1644,9 @@ class WeChatWatcher:
                 "经营线索：客户【已添加企微】✓ 类型=【%s】（旅客=%s, %d/%d）",
                 lead_type or "?", traveler or "?", idx + 1, min(len(popup_queue), self._LEADS_MAX_PER_TICK),
             )
-            self._process_one_lead_popup(lk, lead_hash, traveler, pid)
+            self._process_one_lead_popup(lk, lead_hash, traveler, lead_type, pid)
 
-    def _process_one_lead_popup(self, lk, lead_hash: str, traveler: str, pid: int) -> None:
+    def _process_one_lead_popup(self, lk, lead_hash: str, traveler: str, lead_type: str, pid: int) -> None:
         """单条 lead 的 popup 流程：线索详情→话术→去发送→复制话术并跳转→确认跳转→粘贴发送。"""
         import Quartz
 
@@ -1679,7 +1711,7 @@ class WeChatWatcher:
                 "经营线索：popup 无话术（疑似客户未真正加企微），跳过本条 hash=%s",
                 lead_hash[:12],
             )
-            self._processed_leads.add(lead_hash)
+            self._mark_lead_processed(lead_hash, lead_type, traveler)
             self._close_xiansuo_popups()
             return
         logger.info("经营线索：popup 已加载完成（'话术' label 已出现）")
@@ -1699,12 +1731,12 @@ class WeChatWatcher:
                 "经营线索：popup 有'话术' label 但 4s 内未找到下方'去发送'按钮，hash=%s",
                 lead_hash[:12],
             )
-            self._processed_leads.add(lead_hash)
+            self._mark_lead_processed(lead_hash, lead_type, traveler)
             self._close_xiansuo_popups()
             return
         if not self._press(send_btn, pid):
             logger.warning("经营线索：点击话术'去发送'失败")
-            self._processed_leads.add(lead_hash)
+            self._mark_lead_processed(lead_hash, lead_type, traveler)
             self._close_xiansuo_popups()
             return
         logger.info("经营线索：点击话术'去发送'")
@@ -1714,7 +1746,7 @@ class WeChatWatcher:
         if not self._click_button_with_retry(
             "复制话术并跳转", "复制话术并跳转至单聊窗口", pid, wait_timeout=8.0,
         ):
-            self._processed_leads.add(lead_hash)
+            self._mark_lead_processed(lead_hash, lead_type, traveler)
             self._close_xiansuo_popups()
             return
 
@@ -1723,7 +1755,7 @@ class WeChatWatcher:
         if not self._click_button_with_retry(
             "确认跳转", "确认跳转", pid, wait_timeout=6.0,
         ):
-            self._processed_leads.add(lead_hash)
+            self._mark_lead_processed(lead_hash, lead_type, traveler)
             self._close_xiansuo_popups()
             return
 
@@ -1733,7 +1765,7 @@ class WeChatWatcher:
                 "经营线索：8s 内未切到 %r 的单聊页，**放弃粘贴发送**（避免误发其他聊天），hash=%s",
                 traveler, lead_hash[:12],
             )
-            self._processed_leads.add(lead_hash)
+            self._mark_lead_processed(lead_hash, lead_type, traveler)
             self._close_xiansuo_popups()
             return
 
@@ -1751,7 +1783,7 @@ class WeChatWatcher:
                 "经营线索：粘贴/发送话术失败 hash=%s", lead_hash[:12],
             )
 
-        self._processed_leads.add(lead_hash)
+        self._mark_lead_processed(lead_hash, lead_type, traveler)
         time.sleep(0.5)
         self._close_xiansuo_popups()
 
@@ -2472,7 +2504,7 @@ class WeChatWatcher:
             # 每 6 个 tick（~30s）持久化一次 processed_leads（小开销）
             last_leads_save += 1
             if last_leads_save >= 6:
-                _save_processed_leads(self._processed_leads, self._processed_lead_prefixes)
+                _save_processed_leads(self._processed_leads, self._processed_lead_prefixes, self._processed_lead_traveler_keys)
                 last_leads_save = 0
             # 切片睡眠：响应优雅退出更快，最多多睡 0.5s
             slept = 0.0
@@ -2480,7 +2512,7 @@ class WeChatWatcher:
                 time.sleep(0.5)
                 slept += 0.5
         # 退出前最后一次保存
-        _save_processed_leads(self._processed_leads, self._processed_lead_prefixes)
+        _save_processed_leads(self._processed_leads, self._processed_lead_prefixes, self._processed_lead_traveler_keys)
         logger.info("WeCom Mac Watcher 收到退出信号，已优雅退出")
 
 

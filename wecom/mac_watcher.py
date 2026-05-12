@@ -989,6 +989,16 @@ class WeChatWatcher:
             pass
 
         try:
+            # 写入前先清空：之前如果发送失败可能在输入框留下残留草稿
+            try:
+                existing = str(getattr(input_box, "AXValue", "") or "")
+                if existing.strip():
+                    logger.info("输入框有残留草稿 %r，清空后重写", existing[:40])
+                    setattr(input_box, "AXValue", "")
+                    time.sleep(0.1)
+            except Exception as exc:
+                logger.debug("清空输入框失败：%s", exc)
+
             # 写入文本：按顺序尝试多种 API，记录实际用的方法
             used_method = ""
             for name, setter in (

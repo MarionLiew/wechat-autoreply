@@ -3,13 +3,21 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # ── 大模型配置 ──────────────────────────────────────────
-    # provider: anthropic / openai / moonshot / zhipu / qwen / custom
+    # provider: anthropic / openai / moonshot / zhipu / qwen / mimo / custom
     llm_provider: str = "anthropic"
     llm_api_key: str = ""          # 存储 API Key（可以有 Key 但不启用）
     llm_base_url: str = ""         # 自定义 base URL（OpenAI 兼容接口用）
     llm_model: str = ""            # 统一模型名（为空时按 provider 使用默认值）
     llm_enabled: bool = False      # 独立开关：即使配置了 Key 也可关闭 LLM
     system_prompt: str = "你是一位专业的客服助手，请用简洁、礼貌的中文回复客户问题。"
+
+    # ── 各 provider 独立 API Key（切换 provider 时自动带出） ──
+    anthropic_api_key: str = ""
+    openai_api_key: str = ""
+    moonshot_api_key: str = ""
+    zhipu_api_key: str = ""
+    qwen_api_key: str = ""
+    mimo_api_key: str = ""
 
     # ── 向后兼容（旧字段，供已有 .env 文件过渡用） ──────────
     claude_api_key: str = ""
@@ -96,9 +104,22 @@ class Settings(BaseSettings):
         return any(kw.lower() in low for kw in self.excluded_sender_list)
 
     @property
+    def provider_api_keys(self) -> dict[str, str]:
+        """各 provider 独立 key 的映射。"""
+        return {
+            "anthropic": self.anthropic_api_key,
+            "openai": self.openai_api_key,
+            "moonshot": self.moonshot_api_key,
+            "zhipu": self.zhipu_api_key,
+            "qwen": self.qwen_api_key,
+            "mimo": self.mimo_api_key,
+        }
+
+    @property
     def effective_api_key(self) -> str:
-        """优先使用新字段 llm_api_key，向后兼容旧字段 claude_api_key。"""
-        return self.llm_api_key or self.claude_api_key
+        """优先使用当前 provider 的独立 key，其次 llm_api_key，最后 claude_api_key。"""
+        provider_key = self.provider_api_keys.get(self.llm_provider, "")
+        return provider_key or self.llm_api_key or self.claude_api_key
 
     @property
     def effective_model(self) -> str:
@@ -111,6 +132,7 @@ class Settings(BaseSettings):
             "moonshot": "moonshot-v1-8k",
             "zhipu": "glm-4-flash",
             "qwen": "qwen-turbo",
+            "mimo": "mimo-v2.5",
             "custom": "",
         }
         return defaults.get(self.llm_provider, self.claude_model)
@@ -133,7 +155,7 @@ def validate_startup_config() -> list[str]:
     if settings.llm_enabled:
         if not settings.effective_api_key:
             raise RuntimeError("LLM_ENABLED=true 但 LLM_API_KEY 为空，请在 .env 配置")
-        valid_providers = {"anthropic", "openai", "moonshot", "zhipu", "qwen", "custom"}
+        valid_providers = {"anthropic", "openai", "moonshot", "zhipu", "qwen", "mimo", "custom"}
         if settings.llm_provider not in valid_providers:
             raise RuntimeError(
                 f"LLM_PROVIDER={settings.llm_provider!r} 不支持，仅支持 {valid_providers}"

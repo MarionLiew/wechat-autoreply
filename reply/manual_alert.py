@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """需人工处理判定 + 邮件提醒。
 
 触发条件：客户消息里出现"选座 / 改签 / 退票 / 升舱 / 查里程 / 帮我办..."等
@@ -5,7 +7,6 @@ bot 实际办不了、必须本人操作的关键词。
 
 throttle：同一客户 10 分钟内只发一封邮件（避免连续消息刷屏）。
 """
-from __future__ import annotations
 
 import logging
 import re

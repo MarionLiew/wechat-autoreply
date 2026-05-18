@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 混合回复引擎：多层回退优先级。
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """废话库：读写 fillers.json，提供不重复随机抽取。"""
 
 import json

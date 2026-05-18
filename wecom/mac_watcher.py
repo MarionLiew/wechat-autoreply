@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 企业微信 Mac 桌面端自动回复监听器
 
@@ -216,7 +218,20 @@ class WeChatWatcher:
         except Exception as exc:
             raise RuntimeError("无法枚举企业微信窗口") from exc
         if not windows:
-            raise RuntimeError("企业微信没有已打开的窗口")
+            # 窗口最小化或隐藏 → 自动激活拉起
+            import subprocess
+            logger.info("企业微信无窗口，尝试 activate 拉起…")
+            subprocess.run(
+                ["open", "-b", settings.wecom_bundle_id],
+                capture_output=True, text=True, timeout=5,
+            )
+            time.sleep(2.0)
+            try:
+                windows = app.AXWindows
+            except Exception:
+                windows = []
+            if not windows:
+                raise RuntimeError("企业微信没有已打开的窗口")
         # 优先找 title='企业微信' 的窗口，跳过输入法浮层或模态对话框
         for w in windows:
             try:
@@ -1118,6 +1133,64 @@ class WeChatWatcher:
             pass
 
         try:
+            # ── 最终 panel 校验：写入前确认当前聊天仍是目标 sender ──
+            # _switch_to_conv_and_verify 验证后、到这里可能已有其他 daemon
+            # 实例切走了 UI（如经营线索处理），导致输入框属于错误会话。
+            if expected_sender:
+                sender_core = expected_sender.split("(")[0].strip()
+                try:
+                    cur = self._active_chat_sender(self._get_main_window())
+                except Exception:
+                    cur = ""
+                if cur and sender_core and sender_core not in cur and cur not in sender_core:
+                    logger.warning(
+                        "写入前 panel 校验失败：期望 [%s]，实际 [%s]，尝试重切",
+                        expected_sender, cur,
+                    )
+                    if conv_row is not None and self._switch_to_conv_and_verify(conv_row, expected_sender):
+                        # 重切成功，重新获取 window 和输入框（AX 引用已失效）
+                        try:
+                            window = self._get_main_window()
+                        except Exception:
+                            logger.error("重切后获取窗口失败，放弃发送")
+                            return False, ""
+                        # 重新选择输入框：重切后 AX 树已更新，旧 input_box 引用失效
+                        text_areas_all = _deep_find_all(window, "AXTextArea", max_depth=15)
+                        panel_rects = _scan_panel_rects()
+                        candidates = []
+                        for ta in text_areas_all:
+                            try:
+                                v = str(getattr(ta, "AXValue", "") or "")
+                                if v.replace('​', '').strip() == "BOT":
+                                    continue
+                                if _in_panel_rect(ta):
+                                    continue
+                                candidates.append(ta)
+                            except Exception:
+                                candidates.append(ta)
+                        candidates.sort(key=_area)
+                        empty_candidates = [
+                            c for c in candidates
+                            if not str(getattr(c, "AXValue", "") or "").strip()
+                        ]
+                        if empty_candidates or candidates:
+                            input_box = (empty_candidates[-1] if empty_candidates else candidates[-1])
+                            try:
+                                pos = getattr(input_box, "AXPosition", None)
+                                sz = getattr(input_box, "AXSize", None)
+                                logger.info("重切后重新选用输入框：pos=%s size=%s", pos, sz)
+                            except Exception:
+                                pass
+                        else:
+                            logger.error("重切后找不到输入框，放弃发送")
+                            return False, ""
+                    else:
+                        logger.error(
+                            "重切失败，放弃发送（避免误发到 [%s]）",
+                            cur or "?",
+                        )
+                        return False, ""
+
             # 写入前先清空：之前如果发送失败可能在输入框留下残留草稿
             try:
                 existing = str(getattr(input_box, "AXValue", "") or "")
@@ -1742,10 +1815,28 @@ class WeChatWatcher:
         logger.info("经营线索：点击话术'去发送'")
 
         # 2) 等 popup 切到"复制话术并跳转"状态，点击该按钮
+        #    新版企微 UI 可能直接显示"发送"按钮（不再经过"复制话术并跳转"）
         time.sleep(1.0)  # popup 切换缓冲
         if not self._click_button_with_retry(
-            "复制话术并跳转", "复制话术并跳转至单聊窗口", pid, wait_timeout=8.0,
+            "复制话术并跳转", "复制话术并跳转至单聊窗口", pid, wait_timeout=10.0,
         ):
+            # 兜底：新版企微直接弹出话术预览，有"发送"按钮
+            if self._click_button_with_retry(
+                "发送", "发送（新版 UI 兜底）", pid, wait_timeout=4.0,
+            ):
+                logger.info("经营线索：新版 UI 直接发送话术 旅客=%s", traveler)
+                # 等发送完成，不需要再走"确认跳转→粘贴"流程
+                self._mark_lead_processed(lead_hash, lead_type, traveler)
+                time.sleep(0.5)
+                self._close_xiansuo_popups()
+                leads_log.record_lead_sent(traveler, lead_hash)
+                self._daily.record_lead()
+                today_count = leads_log.count_today()
+                logger.info(
+                    "经营线索：✅ 全流程完成 旅客=%s hash=%s 话术已发送 📊 今日累计 %d 条",
+                    traveler, lead_hash[:12], today_count,
+                )
+                return
             self._mark_lead_processed(lead_hash, lead_type, traveler)
             self._close_xiansuo_popups()
             return
@@ -2271,6 +2362,11 @@ class WeChatWatcher:
             if sender not in current_unread_senders:
                 self._last_text_by_sender.pop(sender, None)
 
+        # ── 分两阶段处理：先普通消息回复，再经营线索 ──
+        # 经营线索 handler 会切走 WeCom UI 到线索频道，如果在循环中间执行，
+        # 后续普通消息的 send_reply 会把回复发到错误会话。
+        lead_msgs: list[dict] = []
+
         for msg in parsed:
             sender = msg["sender_id"]
 
@@ -2285,9 +2381,9 @@ class WeChatWatcher:
                 self._last_text_by_sender[sender] = msg["text"]
                 continue
 
-            # 经营线索：特殊处理——点击线索详情 → 去联系，不走普通回复流程
+            # 经营线索：延迟到所有普通消息处理完后再处理
             if "经营线索" in sender:
-                self._handle_jingying_leads(msg["conv_row"])
+                lead_msgs.append(msg)
                 self._last_text_by_sender[sender] = msg["text"]
                 continue
 
@@ -2477,6 +2573,10 @@ class WeChatWatcher:
                 )
             else:
                 self._daily.record_failure()
+
+        # ── 阶段 2：经营线索处理（放在最后，避免 UI 切换干扰普通消息回复） ──
+        for msg in lead_msgs:
+            self._handle_jingying_leads(msg["conv_row"])
 
     def run(self) -> None:
         """启动轮询守护循环。SIGTERM/SIGINT 后会在当前 tick 完成后优雅退出。"""

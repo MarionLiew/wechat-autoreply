@@ -31,11 +31,22 @@ from storage.fillers import load_fillers, save_fillers
 RULES_FILE = _ROOT / "rules.json"
 FILLERS_FILE = _ROOT / "fillers.json"
 
+# provider → .env 中独立 key 字段名
+_PROVIDER_KEY_FIELD = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "zhipu": "ZHIPU_API_KEY",
+    "qwen": "QWEN_API_KEY",
+    "mimo": "MIMO_API_KEY",
+}
+
 st.set_page_config(page_title="企业微信自动回复 - 管理后台", layout="wide")
 st.title("企业微信自动回复 管理后台")
 
+_tab1_label = "⚙️ 概览" if is_configured() else "⚙️ 初始化向导"
 tab_setup, tab_rules, tab_settings, tab_logs = st.tabs(
-    ["⚙️ 初始化向导", "回复规则", "🛠 高级设置", "消息日志"]
+    [_tab1_label, "回复规则", "🛠 高级设置", "消息日志"]
 )
 
 
@@ -105,19 +116,77 @@ def _render_config_overview():
 
     st.divider()
 
-    # ── 配置概览 ──────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns(4)
-    provider_label = PROVIDER_LABELS.get(cfg["LLM_PROVIDER"], cfg["LLM_PROVIDER"])
-    col1.metric("大模型 Provider", provider_label if cfg["LLM_ENABLED"] else "未启用")
-    col2.metric("模型", cfg["LLM_MODEL"] or PROVIDER_DEFAULT_MODELS.get(cfg["LLM_PROVIDER"], "-"))
-    col3.metric(
-        "回复延迟",
-        f"{cfg['REPLY_DELAY_MIN_SECONDS']:.1f}–{cfg['REPLY_DELAY_MAX_SECONDS']:.1f} 秒",
-    )
-    col4.metric("轮询间隔", f"{cfg['POLL_INTERVAL_SECONDS']} 秒")
+    # ── 大模型配置（可编辑） ────────────────────────────────
+    st.subheader("大模型配置")
 
-    if cfg["LLM_API_KEY"]:
-        st.caption(f"API Key：{_mask_key(cfg['LLM_API_KEY'])}")
+    provider_keys = list(PROVIDER_LABELS.keys())
+    provider_labels = list(PROVIDER_LABELS.values())
+    cur_provider = cfg["LLM_PROVIDER"]
+    cur_idx = provider_keys.index(cur_provider) if cur_provider in provider_keys else 0
+
+    col_p, col_m = st.columns(2)
+    with col_p:
+        selected_label = st.selectbox(
+            "Provider",
+            provider_labels,
+            index=cur_idx,
+            key="overview_provider_sel",
+        )
+        new_provider = provider_keys[provider_labels.index(selected_label)]
+
+    default_model = PROVIDER_DEFAULT_MODELS.get(new_provider, "")
+    # 切换 provider 时，模型框自动变为新 provider 的默认值
+    prev_provider = st.session_state.get("_prev_provider")
+    if prev_provider != new_provider:
+        st.session_state["_prev_provider"] = new_provider
+        st.session_state["overview_model_input"] = default_model
+
+    with col_m:
+        new_model = st.text_input(
+            "模型（留空用默认值）",
+            value=default_model,
+            placeholder=default_model,
+            key="overview_model_input",
+        )
+
+    # 当前选中 provider 的已存 key
+    cur_provider_key = cfg.get(_PROVIDER_KEY_FIELD.get(new_provider, ""), "")
+
+    col_key, col_delay, col_poll = st.columns([2, 1, 1])
+    with col_key:
+        new_api_key = st.text_input(
+            f"API Key（{PROVIDER_LABELS.get(new_provider, new_provider)}）",
+            value=cur_provider_key,
+            type="password",
+            placeholder="sk-xxx...",
+            key="overview_apikey_input",
+        )
+    with col_delay:
+        st.metric(
+            "回复延迟",
+            f"{cfg['REPLY_DELAY_MIN_SECONDS']:.1f}–{cfg['REPLY_DELAY_MAX_SECONDS']:.1f} 秒",
+        )
+    with col_poll:
+        st.metric("轮询间隔", f"{cfg['POLL_INTERVAL_SECONDS']} 秒")
+
+    # 保存按钮：有变更时才显示
+    changed = (
+        new_provider != cur_provider
+        or new_model != (cfg["LLM_MODEL"] or default_model)
+        or new_api_key != cur_provider_key
+    )
+    if changed:
+        if st.button("保存大模型配置", type="primary", key="overview_save_llm"):
+            set_env_key("LLM_PROVIDER", new_provider)
+            set_env_key("LLM_MODEL", new_model if new_model != default_model else "")
+            # 写入 provider 独立 key
+            key_field = _PROVIDER_KEY_FIELD.get(new_provider)
+            if key_field:
+                set_env_key(key_field, new_api_key)
+            # 同步到 LLM_API_KEY（运行时用）
+            set_env_key("LLM_API_KEY", new_api_key)
+            st.toast("已保存，重启守护进程后生效", icon="✅")
+            st.rerun()
 
     # ── 守护进程状态 ──────────────────────────────────────
     st.divider()
@@ -130,13 +199,6 @@ def _render_config_overview():
     else:
         st.warning(f"企业微信：{wc_msg}")
 
-    st.divider()
-    if st.button("重新配置向导", type="secondary"):
-        for k in list(st.session_state.keys()):
-            if k.startswith("wiz_"):
-                del st.session_state[k]
-        st.session_state["wiz_force"] = True
-        st.rerun()
 
 
 # ── 向导步骤渲染 ──────────────────────────────────────────────
@@ -430,9 +492,12 @@ def _wizard_step5():
             st.rerun()
     with col_confirm:
         if st.button("确认写入配置文件", type="primary", key="wiz_confirm"):
+            # 同时写入 provider 独立 key
+            provider_key_field = _PROVIDER_KEY_FIELD.get(provider, "")
             config = {
                 "LLM_PROVIDER": provider,
                 "LLM_API_KEY": api_key,
+                **({provider_key_field: api_key} if provider_key_field else {}),
                 "LLM_BASE_URL": base_url,
                 "LLM_MODEL": model,
                 "LLM_ENABLED": str(llm_on).lower(),
@@ -502,7 +567,7 @@ def _render_wizard():
 
 
 with tab_setup:
-    if is_configured() and not st.session_state.get("wiz_force", False):
+    if is_configured():
         _render_config_overview()
     else:
         _render_wizard()
@@ -920,6 +985,25 @@ with tab_settings:
         )
 
     st.divider()
+    # ── 每日邮件报表 ──────────────────────────────────────────
+    st.subheader("每日邮件报表")
+    st.caption("每天凌晨发送昨日汇总（回复数/失败数/线索条数）到指定邮箱。")
+
+    daily_report_on = st.toggle(
+        "启用每日邮件报表",
+        value=_cur.daily_report_enabled,
+    )
+    smtp_col1, smtp_col2 = st.columns(2)
+    with smtp_col1:
+        smtp_host = st.text_input("SMTP 服务器", value=_cur.smtp_host, placeholder="smtp.qq.com")
+        smtp_port = st.number_input("SMTP 端口", value=int(_cur.smtp_port), min_value=1, max_value=65535)
+        smtp_user = st.text_input("发件邮箱", value=_cur.smtp_user, placeholder="xxx@qq.com")
+    with smtp_col2:
+        smtp_password = st.text_input("SMTP 授权码", value=_cur.smtp_password, type="password")
+        smtp_from = st.text_input("显示发件人（可选）", value=_cur.smtp_from)
+        smtp_to = st.text_input("收件邮箱", value=_cur.smtp_to, placeholder="接收报表的邮箱地址")
+
+    st.divider()
     if st.button("💾 保存设置", type="primary"):
         # 校验
         errs = []
@@ -947,6 +1031,13 @@ with tab_settings:
                 "RAG_DIRECT_THRESHOLD": f"{rag_direct_threshold}",
                 "RAG_FEWSHOT_THRESHOLD": f"{rag_fewshot_threshold}",
                 "RAG_TOPK": f"{int(rag_topk)}",
+                "DAILY_REPORT_ENABLED": "true" if daily_report_on else "false",
+                "SMTP_HOST": smtp_host,
+                "SMTP_PORT": f"{int(smtp_port)}",
+                "SMTP_USER": smtp_user,
+                "SMTP_PASSWORD": smtp_password,
+                "SMTP_FROM": smtp_from,
+                "SMTP_TO": smtp_to,
             })
             st.success("已保存。请重启守护进程使设置生效。")
 
@@ -965,6 +1056,10 @@ with tab_settings:
             "rag_direct_threshold": _cur.rag_direct_threshold,
             "rag_fewshot_threshold": _cur.rag_fewshot_threshold,
             "rag_topk": _cur.rag_topk,
+            "daily_report_enabled": _cur.daily_report_enabled,
+            "smtp_host": _cur.smtp_host,
+            "smtp_port": _cur.smtp_port,
+            "smtp_to": _cur.smtp_to,
         })
 
 

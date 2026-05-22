@@ -27,6 +27,7 @@ PROVIDER_DEFAULT_MODELS = {
     "moonshot": "moonshot-v1-8k",
     "zhipu": "glm-4-flash",
     "qwen": "qwen-turbo",
+    "mimo": "MiMo-V2.5",
     "custom": "",
 }
 
@@ -36,6 +37,7 @@ PROVIDER_LABELS = {
     "moonshot": "月之暗面 (Moonshot)",
     "zhipu": "智谱 AI (GLM)",
     "qwen": "阿里百炼 (Qwen)",
+    "mimo": "小米 MiMo",
     "custom": "自定义（OpenAI 兼容）",
 }
 
@@ -59,6 +61,13 @@ def read_current_config() -> dict:
     return {
         "LLM_PROVIDER": vals.get("LLM_PROVIDER", "anthropic"),
         "LLM_API_KEY": vals.get("LLM_API_KEY", "") or vals.get("CLAUDE_API_KEY", ""),
+        # 各 provider 独立 API Key
+        "ANTHROPIC_API_KEY": vals.get("ANTHROPIC_API_KEY", ""),
+        "OPENAI_API_KEY": vals.get("OPENAI_API_KEY", ""),
+        "MOONSHOT_API_KEY": vals.get("MOONSHOT_API_KEY", ""),
+        "ZHIPU_API_KEY": vals.get("ZHIPU_API_KEY", ""),
+        "QWEN_API_KEY": vals.get("QWEN_API_KEY", ""),
+        "MIMO_API_KEY": vals.get("MIMO_API_KEY", ""),
         "LLM_BASE_URL": vals.get("LLM_BASE_URL", ""),
         "LLM_MODEL": vals.get("LLM_MODEL", ""),
         "LLM_ENABLED": vals.get("LLM_ENABLED", "false").lower() == "true",
@@ -75,6 +84,14 @@ def read_current_config() -> dict:
         "RAG_DIRECT_THRESHOLD": float(vals.get("RAG_DIRECT_THRESHOLD", "0.85")),
         "RAG_FEWSHOT_THRESHOLD": float(vals.get("RAG_FEWSHOT_THRESHOLD", "0.55")),
         "RAG_TOPK": int(vals.get("RAG_TOPK", "3")),
+        # 邮件报表
+        "DAILY_REPORT_ENABLED": vals.get("DAILY_REPORT_ENABLED", "false").lower() == "true",
+        "SMTP_HOST": vals.get("SMTP_HOST", "smtp.qq.com"),
+        "SMTP_PORT": int(vals.get("SMTP_PORT", "465")),
+        "SMTP_USER": vals.get("SMTP_USER", ""),
+        "SMTP_PASSWORD": vals.get("SMTP_PASSWORD", ""),
+        "SMTP_FROM": vals.get("SMTP_FROM", ""),
+        "SMTP_TO": vals.get("SMTP_TO", ""),
     }
 
 

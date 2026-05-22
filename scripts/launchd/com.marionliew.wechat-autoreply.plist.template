@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.marionliew.wechat-autoreply</string>
+    <string>__LABEL__</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/marionliew/code/wechat-autoreply/.venv/bin/python</string>
-        <string>/Users/marionliew/code/wechat-autoreply/run.py</string>
+        <string>__PROJECT_DIR__/.venv/bin/python</string>
+        <string>__PROJECT_DIR__/run.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/marionliew/code/wechat-autoreply</string>
+    <string>__PROJECT_DIR__</string>
 
     <!-- 开机/登录后自动启动 -->
     <key>RunAtLoad</key>
@@ -32,9 +32,9 @@
 
     <!-- launchd 自己的标准输出/错误（与 Python 内部 RotatingFileHandler 的 daemon.log 分开） -->
     <key>StandardOutPath</key>
-    <string>/Users/marionliew/code/wechat-autoreply/daemon.stdout.log</string>
+    <string>__PROJECT_DIR__/daemon.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/marionliew/code/wechat-autoreply/daemon.stderr.log</string>
+    <string>__PROJECT_DIR__/daemon.stderr.log</string>
 
     <!-- 让 Python 看到 UTF-8 文件 -->
     <key>EnvironmentVariables</key>

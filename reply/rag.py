@@ -16,17 +16,24 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
+# 模型已缓存到本地，跳过 huggingface.co 的联网检查（避免 SSL 超时拖慢启动）
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 
 MODEL_NAME = "maidalun1020/bce-embedding-base_v1"
 
 # 模型只载入一次，跨 manager 共享
 _model = None
+
+# 短查询保护：查询太短时禁止 A 路径直接复用（短句歧义大，同一文本在不同上下文意思完全不同）
+_MIN_QUERY_LEN_FOR_DIRECT = 5
 
 
 # ── 历史回复清洗 + 安全性判定 ──────────────────────────────────────
@@ -253,6 +260,9 @@ class RagRetriever:
         else:
             idx = np.argpartition(-scores, k)[:k]
             idx = idx[np.argsort(-scores[idx])]
+        # 短查询保护：查询太短时禁止 A 路径直接复用，避免"取消了""好的"等短句
+        # 在不同上下文被误匹配（如退票场景的"取消了" vs 对话收尾的"取消了"）
+        query_too_short = len(query.strip()) < _MIN_QUERY_LEN_FOR_DIRECT
         hits = []
         for i in idx[:k]:
             s = float(scores[i])
@@ -260,6 +270,7 @@ class RagRetriever:
                 continue
             m = self._meta[i]
             cleaned_a = _sanitize_reply(m["a"])
+            safe = _is_safe_for_direct(cleaned_a) and not query_too_short
             hits.append({
                 "q": m["q"],
                 "a": cleaned_a,                                 # 清洗后的回复（去引用块）
@@ -267,7 +278,7 @@ class RagRetriever:
                 "customer": m.get("customer", ""),
                 "ts": m.get("ts", ""),
                 "score": s,
-                "safe_for_direct": _is_safe_for_direct(cleaned_a),
+                "safe_for_direct": safe,
             })
         return hits
 

@@ -4,15 +4,18 @@
 
 ## 安装
 
+一键安装（推荐）：
+
 ```bash
-# 1) 拷贝 plist 到 LaunchAgents
-cp scripts/launchd/com.marionliew.wechat-autoreply.plist ~/Library/LaunchAgents/
+bash scripts/launchd/install_launchd.sh
+```
 
-# 2) 加载
-launchctl load -w ~/Library/LaunchAgents/com.marionliew.wechat-autoreply.plist
+这会从模板自动生成 plist（路径自动填入当前项目目录），注册到 LaunchAgents 并加载。
 
-# 3) 立刻启动
-launchctl start com.marionliew.wechat-autoreply
+卸载：
+
+```bash
+bash scripts/launchd/install_launchd.sh uninstall
 ```
 
 ## 状态 / 控制

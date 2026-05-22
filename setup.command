@@ -97,7 +97,7 @@ step "步骤 3 / 4：安装依赖（约 1-3 分钟）"
 
 uv pip install -r requirements.txt \
     || die "核心依赖安装失败，请检查网络后重试"
-ok "核心依赖安装完成"
+ok "核心依赖安装完成（含 RAG 向量检索依赖）"
 
 if uv pip install -r requirements-mac.txt; then
     ok "macOS 辅助功能依赖安装完成"

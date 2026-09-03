@@ -6,9 +6,10 @@
       "name": "表情",
       "match_type": "regex",
       "keyword": null,
-      "pattern": "\\[.*\\]",
+      "pattern": "\\[(?!.*(语音|视频|通话)).*\\]",
       "reply": "[握手]",
-      "priority": 1
+      "priority": 1,
+      "max_length": 20
     },
     {
       "id": "rule_62f5ce",
@@ -19,7 +20,32 @@
       "pattern": null,
       "reply": "不客气～",
       "priority": 2,
-      "ignore_case": false
+      "ignore_case": false,
+      "max_length": 30
+    },
+    {
+      "id": "rule_9d4c1a",
+      "enabled": true,
+      "name": "谢谢(繁体/其他致谢用语)",
+      "match_type": "regex",
+      "keyword": null,
+      "pattern": "谢谢|謝謝|感謝|感谢|多谢|多謝|thanks|thank you",
+      "reply": "不客气～",
+      "priority": 2,
+      "ignore_case": true,
+      "max_length": 30
+    },
+    {
+      "id": "rule_7b2e91",
+      "enabled": true,
+      "name": "纯确认/收到类短语",
+      "match_type": "regex",
+      "keyword": null,
+      "pattern": "^(了解|收到|好的|好嘞|明白了?|知道了?|OK|ok)[，,。.！!～~]*$",
+      "reply": "好的～",
+      "priority": 3,
+      "ignore_case": true,
+      "max_length": 20
     }
   ]
 }

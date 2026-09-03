@@ -145,4 +145,11 @@ def process_message(
             "content": reply,
         }
 
+    # 保底：mimo 与 moonshot 兜底都连不上时，不再静默跳过，
+    # 发一句安抚话术让客户知道消息已收到、有人会跟进。
+    fallback = settings.llm_fallback_reply.strip()
+    if fallback:
+        logger.warning("LLM 全部失败，发送保底话术 [%s]", sender_id)
+        return {"source": "fallback", "content": fallback}
+
     return {"source": "none", "content": ""}

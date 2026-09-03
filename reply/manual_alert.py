@@ -53,14 +53,20 @@ def needs_manual_handling(customer_message: str) -> str | None:
     return m.group(0) if m else None
 
 
-def maybe_alert(sender: str, customer_message: str, bot_reply: str) -> bool:
+def maybe_alert(
+    sender: str, customer_message: str, bot_reply: str,
+    force_keyword: str | None = None,
+) -> bool:
     """检测 + 发邮件（带节流）。返回是否真发出了邮件。
 
     sender:           客户标识（如 '周斌(男)-1234'）
     customer_message: 客户原话（多条合并文本）
     bot_reply:        bot 即将/已发出的回复内容
+    force_keyword:    跳过关键词正则、直接当命中处理（例如企微内置 AI 自己
+                       判断"这条需要转人工"时传入，作为正则漏判场景的兜底——
+                       两条信号独立，任一命中都提醒）。为 None 时走原逻辑。
     """
-    keyword = needs_manual_handling(customer_message)
+    keyword = force_keyword or needs_manual_handling(customer_message)
     if not keyword:
         return False
 

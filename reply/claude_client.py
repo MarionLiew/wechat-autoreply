@@ -43,6 +43,45 @@ def _resolve_base_url(provider: str, api_key: str) -> str | None:
     return _PROVIDER_BASE_URLS.get(provider)
 
 
+def _http_client():
+    """构造无视系统/环境代理的 httpx 客户端。
+
+    mimo / moonshot 等都是国内端点，不应走用户机器上的 VPN 代理（如 Shadowrocket）。
+    trust_env=False 让 httpx 忽略 macOS 系统代理和 http(s)_proxy 环境变量，直连出网，
+    这样代理无论是否在线、指向哪个端口，都不影响自动回复。
+    """
+    import httpx
+    return httpx.Client(trust_env=False)
+
+
+def _openai_fallback(
+    name: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    system_prompt: str,
+    msgs_array: list[dict],
+) -> str | None:
+    """OpenAI 兼容的兜底调用（moonshot / openrouter 共用）。成功返回文本，失败返回 None。"""
+    logger.warning("主 LLM 失败，切换 %s 兜底（model=%s）", name, model)
+    try:
+        import openai
+        client = openai.OpenAI(api_key=api_key, base_url=base_url, http_client=_http_client())
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{"role": "system", "content": system_prompt}, *msgs_array],
+        )
+        reply = resp.choices[0].message.content
+        if reply:
+            logger.info("%s 兜底成功", name)
+            return reply
+        logger.warning("%s 兜底返回空内容", name)
+    except Exception as exc:
+        logger.error("%s 兜底也失败：%s", name, str(exc)[:200])
+    return None
+
+
 def _get_client():
     global _client
     if _client is not None:
@@ -53,16 +92,16 @@ def _get_client():
 
     if provider == "anthropic":
         import anthropic
-        _client = anthropic.Anthropic(api_key=api_key)
+        _client = anthropic.Anthropic(api_key=api_key, http_client=_http_client())
     elif provider == "mimo":
         # mimo 的 Anthropic 兼容端点（/anthropic），用 Anthropic SDK
         import anthropic
         base_url = settings.llm_base_url or "https://token-plan-cn.xiaomimimo.com/anthropic"
-        _client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
+        _client = anthropic.Anthropic(api_key=api_key, base_url=base_url, http_client=_http_client())
     else:
         import openai
         base_url = settings.llm_base_url or _resolve_base_url(provider, api_key)
-        kwargs = {"api_key": api_key}
+        kwargs = {"api_key": api_key, "http_client": _http_client()}
         if base_url:
             kwargs["base_url"] = base_url
         _client = openai.OpenAI(**kwargs)
@@ -261,35 +300,32 @@ def generate(
                 is_rate = "429" in msg or "overload" in msg.lower() or "rate" in msg.lower()
                 is_mimo_401 = provider == "mimo" and "401" in msg
                 if not is_rate and not is_mimo_401:
-                    raise
+                    # 非限流错误（连接错误/超时等）：不重试，但仍落到下面的
+                    # moonshot 兜底分支，而不是直接 raise 跳过兜底。
+                    logger.warning("LLM 调用出错（非限流，转兜底）：%s", msg[:200])
+                    break
                 if attempt < 3:
                     wait = 2.0 * (attempt + 1)
                     logger.warning("LLM 限流（attempt=%d/%d），%.1fs 后重试：%s",
                                    attempt + 1, 4, wait, msg[:200])
                     time.sleep(wait)
-        # 重试耗尽 → moonshot 兜底（仅非 moonshot provider 时）
+        # 重试耗尽 → 兜底链：moonshot → openrouter（跳过与主 provider 相同的那层）
         if provider != "moonshot" and settings.moonshot_api_key:
-            logger.warning("mimo 重试耗尽，切换 moonshot 兜底")
-            try:
-                import openai
-                fallback = openai.OpenAI(
-                    api_key=settings.moonshot_api_key,
-                    base_url="https://api.moonshot.cn/v1",
-                )
-                resp = fallback.chat.completions.create(
-                    model="moonshot-v1-8k",
-                    max_tokens=1024,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        *msgs_array,
-                    ],
-                )
-                reply = resp.choices[0].message.content
-                if reply:
-                    logger.info("moonshot 兜底成功")
-                    return reply
-            except Exception as fb_exc:
-                logger.error("moonshot 兜底也失败：%s", fb_exc)
+            reply = _openai_fallback(
+                "moonshot", settings.moonshot_api_key,
+                "https://api.moonshot.cn/v1", "moonshot-v1-8k",
+                system_prompt, msgs_array,
+            )
+            if reply:
+                return reply
+        if provider != "openrouter" and settings.openrouter_api_key:
+            reply = _openai_fallback(
+                "openrouter", settings.openrouter_api_key,
+                "https://openrouter.ai/api/v1", settings.openrouter_model,
+                system_prompt, msgs_array,
+            )
+            if reply:
+                return reply
         raise last_exc
 
     except Exception as exc:

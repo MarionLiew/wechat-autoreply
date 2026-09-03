@@ -45,8 +45,8 @@ st.set_page_config(page_title="企业微信自动回复 - 管理后台", layout=
 st.title("企业微信自动回复 管理后台")
 
 _tab1_label = "⚙️ 概览" if is_configured() else "⚙️ 初始化向导"
-tab_setup, tab_rules, tab_settings, tab_logs = st.tabs(
-    [_tab1_label, "回复规则", "🛠 高级设置", "消息日志"]
+tab_setup, tab_rules, tab_settings, tab_logs, tab_learn = st.tabs(
+    [_tab1_label, "回复规则", "🛠 高级设置", "消息日志", "🎓 学习审核"]
 )
 
 
@@ -1215,3 +1215,98 @@ with tab_logs:
     except Exception as e:
         st.error(f"加载消息日志失败：{e}")
         st.info("请确认已安装依赖并正确配置 .env 文件。")
+
+
+with tab_learn:
+    st.subheader("🎓 学习审核")
+    st.caption(
+        "飞轮：① bot 被动捕获真人客户经理的纠正/补答 → ② 你评分=审核 → "
+        "③ 采纳的夜里增量嵌入进 RAG，越用越聪明。你点一次「采纳/👍/👎改正」就是审核通过。"
+    )
+    try:
+        from storage import learned_qa
+        from storage import message_log
+        message_log.init_db()
+
+        pending = learned_qa.load_all(status="pending")
+        approved = learned_qa.load_all(status="approved")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("待审", len(pending))
+        m2.metric("已采纳", len(approved))
+        m3.metric("已弃", len(learned_qa.load_all(status="rejected")))
+
+        # ── Section 1：真人纠正待审 ──────────────────────────
+        st.markdown("### 真人纠正待审")
+        if not pending:
+            st.info("暂无待审候选。bot 运行时会自动捕获真人客户经理在它之后手打的纠正/补答。")
+        for r in pending:
+            qh = r["qhash"]
+            with st.container(border=True):
+                st.markdown(f"**客户** `{r.get('customer','')}`　·　来源 `{r.get('source','')}`")
+                st.markdown(f"**问**：{r.get('q','')}")
+                edited = st.text_area("真人答（可直接改后再采纳）", value=r.get("a", ""), key=f"lq_a_{qh}")
+                if r.get("bot_reply"):
+                    st.caption(f"bot 当时回的：{r['bot_reply']}")
+                b1, b2, _ = st.columns([1, 1, 4])
+                if b1.button("✅ 采纳", key=f"lq_ok_{qh}"):
+                    learned_qa.update_status(qh, "approved", new_a=edited)
+                    st.rerun()
+                if b2.button("❌ 丢弃", key=f"lq_no_{qh}"):
+                    learned_qa.update_status(qh, "rejected")
+                    st.rerun()
+
+        # ── Section 2：bot 回复评分 ──────────────────────────
+        st.markdown("### bot 回复评分")
+        _BOT_SOURCES = {
+            "llm", "llm_rag", "rag_fewshot", "rag_direct", "rag_direct_sub",
+            "fallback", "filler", "filler_ratelimited", "claude",
+        }
+        rated = learned_qa.rated_reply_keys()
+        recent = message_log.get_recent_logs(limit=200)
+        unrated = [
+            lg for lg in recent
+            if (lg.source or "") in _BOT_SOURCES and lg.reply and lg.message
+            and learned_qa._reply_key(lg.customer_id, lg.message, lg.reply) not in rated
+        ]
+        if not unrated:
+            st.info("近期没有待评分的 bot 回复。")
+        for lg in unrated[:30]:
+            key = learned_qa._reply_key(lg.customer_id, lg.message, lg.reply)
+            with st.container(border=True):
+                st.markdown(f"**客户** `{lg.customer_id}`　·　来源 `{lg.source}`")
+                st.markdown(f"**问**：{lg.message}")
+                st.markdown(f"**bot 答**：{lg.reply}")
+                fix = st.text_input("👎 不好？写出正确答案（提交即采纳为正确语料）", key=f"bm_fix_{key}")
+                g1, g2, _ = st.columns([1, 1.5, 4])
+                if g1.button("👍 好", key=f"bm_good_{key}"):
+                    learned_qa.save_candidate(
+                        lg.customer_id, lg.message, lg.reply,
+                        source="bot_confirmed", status="approved",
+                    )
+                    learned_qa.mark_reply_rated(lg.customer_id, lg.message, lg.reply)
+                    st.rerun()
+                if g2.button("👎 提交正确答案", key=f"bm_bad_{key}"):
+                    if fix.strip():
+                        learned_qa.save_candidate(
+                            lg.customer_id, lg.message, fix,
+                            bot_reply=lg.reply, source="manual_correction", status="approved",
+                        )
+                        learned_qa.mark_reply_rated(lg.customer_id, lg.message, lg.reply)
+                        st.rerun()
+                    else:
+                        st.warning("请先在上面写出正确答案，再点 👎 提交。")
+
+        # ── 已采纳预览（将进 ③ 增量嵌入）──────────────────────
+        if approved:
+            with st.expander(f"✅ 已采纳 {len(approved)} 条（待夜间增量嵌入进 RAG）"):
+                import pandas as pd
+                st.dataframe(
+                    pd.DataFrame([
+                        {"客户": a.get("customer", ""), "问": a.get("q", ""),
+                         "采纳答案": a.get("a", ""), "来源": a.get("source", "")}
+                        for a in approved
+                    ]),
+                    use_container_width=True, hide_index=True,
+                )
+    except Exception as e:
+        st.error(f"加载学习审核失败：{e}")

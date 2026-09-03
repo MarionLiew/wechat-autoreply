@@ -36,9 +36,10 @@ except ImportError:
     )
 
 from config import settings
-from reply import engine, manual_alert
+from reply import engine, manual_alert, rules
 from storage import leads_log, mailer, message_log
 from storage.daily_stats import DailyTracker
+from wecom import ai_panel
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,8 @@ class WeChatWatcher:
         # 若 preview 文本在此集合里，说明几乎肯定是 bot 自己发的，不应再回。
         # 启动时从 DB 加载近 24h 记录，防止重启后丢失导致自回环。
         self._bot_sent_texts: dict[str, set] = message_log.get_recent_bot_replies(hours=24)
+        # 最近一次读到的带方向聊天面板 (sender, [{side,text}...])，供学习飞轮采集真人纠正
+        self._last_panel_directional: tuple[str, list] | None = None
         # 内容级去重：记录每个 sender 上次成功回复时的消息集合（frozenset）。
         # 不会因 sender 暂时离开未读列表而被清除，防止同批次消息被多次回复。
         # 只有当新批次消息集合与上次不同时，才触发回复。
@@ -140,6 +143,8 @@ class WeChatWatcher:
                 len(self._processed_lead_prefixes),
                 len(self._processed_lead_traveler_keys),
             )
+        # AXTable 找不到时自动 activate 企微的冷却（避免每 5 秒刷一次）
+        self._last_axtable_activate_ts: float = 0.0
         # 优雅退出标志：SIGTERM/SIGINT 设置后，循环结束当前 tick 即退
         self._should_stop = False
         # 每日统计：每 tick 末检查跨日 → 发邮件 + 重置
@@ -216,7 +221,11 @@ class WeChatWatcher:
         try:
             windows = app.AXWindows
         except Exception as exc:
-            raise RuntimeError("无法枚举企业微信窗口") from exc
+            # 企业微信卡退/重启后 PID 变了，缓存的 app 引用变陈旧，AXWindows 会一直抛错。
+            # 这里重置缓存引用，下一轮 _get_app() 会按 bundle_id 重新拿到新进程的引用，
+            # 让 daemon 在企微崩溃重启后能自动恢复，无需手动重启。
+            self._app = None
+            raise RuntimeError("无法枚举企业微信窗口（已重置 app 引用，下轮重连）") from exc
         if not windows:
             # 窗口最小化或隐藏 → 自动激活拉起
             import subprocess
@@ -231,6 +240,7 @@ class WeChatWatcher:
             except Exception:
                 windows = []
             if not windows:
+                self._app = None  # 唤起后仍无窗口：引用可能也已陈旧，重置以便下轮重连
                 raise RuntimeError("企业微信没有已打开的窗口")
         # 优先找 title='企业微信' 的窗口，跳过输入法浮层或模态对话框
         for w in windows:
@@ -296,6 +306,12 @@ class WeChatWatcher:
             return True
         # 6. 链接型推送（含"南航 m.csair" 等）
         if "m.csair.c" in t and ("活动" in t or "会员" in t):
+            return True
+        # 7. 客户经理发的"人工客服在线时间"模板（含工作时间说明 + 南航智能客服链接）
+        if "人工客服在线时间" in t and "南航" in t:
+            return True
+        # 8. 含"我会在看到消息后第一时间回复您"这类客服承诺语（出方向模板）
+        if "第一时间回复您" in t or "我会在看到消息后" in t:
             return True
         return False
 
@@ -752,6 +768,21 @@ class WeChatWatcher:
             rows = self._get_conversation_rows(conv_list)
         except Exception as exc:
             logger.warning("查找未读会话失败：%s", exc)
+            # AXTable 找不到通常是窗口最小化/隐藏，尝试 activate 拉到前台
+            if "AXTable" in str(exc):
+                now = time.time()
+                if now - self._last_axtable_activate_ts > 30:
+                    self._last_axtable_activate_ts = now
+                    logger.info("AXTable 缺失，尝试 activate 企业微信到前台…")
+                    try:
+                        import subprocess
+                        subprocess.run(
+                            ["/usr/bin/osascript", "-e",
+                             'tell application "企业微信" to activate'],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                    except Exception as act_exc:
+                        logger.debug("activate 失败：%s", act_exc)
             return []
 
         unread = [r for r in rows if self._has_unread_badge(r)]
@@ -764,6 +795,23 @@ class WeChatWatcher:
             except Exception:
                 pass
         return unread
+
+    def _find_jingying_conv_row(self):
+        """主动查找经营线索会话行（不管有没有未读）。找不到返回 None。"""
+        try:
+            window = self._get_main_window()
+            conv_list = self._find_conversation_list(window)
+            rows = self._get_conversation_rows(conv_list)
+        except Exception as exc:
+            logger.warning("查找经营线索会话失败：%s", exc)
+            return None
+
+        for row in rows:
+            texts = _deep_find_all(row, "AXStaticText", max_depth=5)
+            values = [str(getattr(t, "AXValue", "") or "").strip() for t in texts]
+            if values and "经营线索" in values[0]:
+                return row
+        return None
 
     # ------------------------------------------------------------------
     # Message extraction
@@ -838,38 +886,41 @@ class WeChatWatcher:
             len(tareas), midx,
         )
 
-        # 只保留客户消息（x < 中线）；我方消息（欢迎语、bot回复）在右侧，跳过
-        incoming: list[tuple[float, str]] = []
+        # 左侧(x<中线)=客户(in)，右侧=我方(out，含欢迎语/bot回复/真人补答)
+        # 按 y 坐标分组，合并同行碎片（Chromium 有时把一条消息拆成多个 AXTextArea）
+        from collections import defaultdict as _dd
+        frags_by_y: dict = _dd(list)   # round(y) -> list[(x, val)]
         for t in tareas:
             pos = getattr(t, "AXPosition", None)
             val = str(getattr(t, "AXValue", "") or "").strip()
             if not val or not pos:
                 continue
-            if pos[0] >= midx:
-                continue   # 右侧 = 我方，跳过
-            incoming.append((pos[1], val))  # (y 坐标, 文本)
+            frags_by_y[round(pos[1])].append((pos[0], val))
 
-        if not incoming:
-            logger.debug("read_last_messages: 聊天区无客户侧 AXTextArea")
-            return []
-
-        # 按 y 坐标分组，合并同行碎片（Chromium 有时把一条消息拆成多个 AXTextArea）
-        from collections import defaultdict as _dd
-        by_y: dict = _dd(list)
-        for y, val in incoming:
-            by_y[round(y)].append(val)
-
-        messages: list[str] = []
-        for y in sorted(by_y.keys()):
-            text = "".join(by_y[y]).strip()
-            if text and _is_message_text(text):
+        directional: list[dict] = []   # 按时间(y升序) {side:'in'|'out', text}
+        messages: list[str] = []       # 仅客户侧（保持原返回行为不变）
+        for y in sorted(frags_by_y.keys()):
+            row = frags_by_y[y]
+            text = "".join(v for _, v in row).strip()
+            if not text or not _is_message_text(text):
+                continue
+            side = "in" if min(x for x, _ in row) < midx else "out"
+            directional.append({"side": side, "text": text})
+            if side == "in":
                 messages.append(text)
 
+        # 暂存整段带方向的面板，供「学真人纠正」零额外抢焦点地采集
+        self._last_panel_directional = (expected_sender, directional)
+
+        if not messages:
+            logger.debug("read_last_messages: 聊天区无客户侧消息")
+            return []
+
         logger.debug(
-            "read_last_messages: 客户消息 %d 行（原始碎片 %d 个），返回最后 %d 条",
-            len(messages), len(incoming), min(count, len(messages)),
+            "read_last_messages: 客户消息 %d 行（面板共 %d 行），返回最后 %d 条",
+            len(messages), len(directional), min(count, len(messages)),
         )
-        return messages[-count:] if messages else []
+        return messages[-count:]
 
     def _find_chat_area(self, window):
         """
@@ -900,6 +951,48 @@ class WeChatWatcher:
             "_find_chat_area()。"
         )
 
+    def _harvest_corrections(self, sender: str) -> None:
+        """从最近一次读到的带方向面板，采集「真人客户经理纠正/补答」为 QA 候选。
+
+        识别：面板右侧(out)出现一条**不在 bot 已发集合、且非欢迎模板**的回复
+        → 视为真人手打 → 配它前面最近的客户问题(in) 存入 learned_qa。
+        复用 read_last_messages 当次已读到的面板，**零额外抢焦点**；纯采集，
+        全程 try/except 包裹，绝不影响回复主流程。
+        """
+        if not settings.learn_capture_enabled or not sender:
+            return
+        stash = self._last_panel_directional
+        if not stash or stash[0] != sender or not stash[1]:
+            return
+        bot_sent = self._bot_sent_texts.get(sender, set())
+        from storage import learned_qa
+
+        last_q_parts: list[str] = []   # 最近一段连续客户消息
+        pending_bot = ""               # 该问题下 bot 已发的回复（负样本参考）
+        for item in stash[1]:
+            side, text = item["side"], item["text"]
+            if side == "in":
+                if not last_q_parts:
+                    pending_bot = ""
+                last_q_parts.append(text)
+                continue
+            # side == "out"
+            if self._is_outgoing_template(text):
+                continue
+            if text in bot_sent:
+                pending_bot = text          # bot 发的 → 记为该问题负样本
+                continue
+            # 真人手打回复：配最近客户问题入库
+            q = "\n".join(last_q_parts).strip()
+            if q and 2 <= len(text) <= 200:
+                if learned_qa.save_candidate(sender, q, text, bot_reply=pending_bot):
+                    logger.info(
+                        "学到真人纠正 [%s] Q=%s → A=%s",
+                        sender, q[:30].replace("\n", " "), text[:40],
+                    )
+            last_q_parts = []
+            pending_bot = ""
+
     def extract_last_message(self, conv_row) -> Optional[dict]:
         """
         直接从会话行的 AXCell 中读取发送方和最新消息预览，**不点击、不抢焦点**。
@@ -924,6 +1017,8 @@ class WeChatWatcher:
             return None
 
         sender_id = values[0]
+        # "@微信" 标记 = 真实外部微信客户；群聊/服务号/经营线索/系统通知都没有
+        has_wechat_tag = "@微信" in values
         # 过滤掉时间戳和 '@微信' 这类附加标签，取第一条有效消息
         message_candidates = [
             v for v in values[1:]
@@ -947,6 +1042,7 @@ class WeChatWatcher:
             "sender_id": sender_id,
             "msg_hash": msg_hash,
             "conv_row": conv_row,
+            "has_wechat_tag": has_wechat_tag,
         }
 
     # ------------------------------------------------------------------
@@ -1345,6 +1441,27 @@ class WeChatWatcher:
             logger.error("发送回复失败：%s", exc)
             return False, ""
 
+    # 企微 AI 面板生成较慢（10-40s+），调用前先发个即时表情安抚，避免客户
+    # 以为消息没送到。二选一随机挑，不计入 message_log/每日统计（那是给
+    # 正式回复用的），只做防自回环登记，跟正式发送走一样的登记方式。
+    _QUICK_ACK_TEXTS = ("[握手]", "[玫瑰]")
+
+    def _send_quick_ack(self, conv_row, sender: str) -> None:
+        text = random.choice(self._QUICK_ACK_TEXTS)
+        try:
+            sent, _ = self.send_reply(text, conv_row=conv_row, expected_sender=sender)
+        except Exception as exc:
+            logger.debug("发送即时表情安抚异常：%s", exc)
+            return
+        if not sent:
+            logger.debug("即时表情安抚发送失败，跳过登记")
+            return
+        from collections import deque as _dq
+        dq = self._recent_replies_by_sender.setdefault(sender, _dq(maxlen=20))
+        dq.append((time.time(), text))
+        self._bot_sent_texts.setdefault(sender, set()).add(text)
+        logger.info("已发即时表情安抚 [%s]：%s（AI 面板生成中…）", sender, text)
+
     # ------------------------------------------------------------------
     # 经营线索 处理
     # ------------------------------------------------------------------
@@ -1589,16 +1706,97 @@ class WeChatWatcher:
                 chat_check = None
         return chat_check is not None
 
+    def _scroll_chat_up_for_leads(self, chat_scroll, pid, ticks: int = 8) -> None:
+        """在聊天滚动区中心发送向上滚动事件，让更早的历史消息（含旧线索）重新
+        渲染进 AX 树——聊天区是虚拟化列表，只看当前渲染的可见行会漏掉被
+        滚出可视区的旧线索。"""
+        import Quartz
+        pos = getattr(chat_scroll, "AXPosition", None)
+        sz = getattr(chat_scroll, "AXSize", None)
+        if not pos or not sz:
+            return
+        cx, cy = pos[0] + sz[0] / 2, pos[1] + sz[1] / 2
+        pt = Quartz.CGPointMake(cx, cy)
+        move = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPostToPid(pid, move)
+        ev = Quartz.CGEventCreateScrollWheelEvent(
+            None, Quartz.kCGScrollEventUnitLine, 1, ticks,
+        )
+        Quartz.CGEventPostToPid(pid, ev)
+
+    def _scan_leads_with_scroll(self, chat_scroll, pid, max_rounds: int = 12) -> dict[str, str]:
+        """反复"扫描当前可见行 → 向上滚动"，累积去重后的 {hash: parent_val}。
+
+        只依赖扫到的文本内容（parent_val），不依赖 AX 引用长期有效——虚拟化
+        列表滚动后旧节点的引用会失效，这里只用来判断"到底存在哪些线索"，
+        真正要点击时再按 hash 重新定位（见 _locate_lead_link_by_hash）。
+        连续两轮扫不到新 hash 才停（说明已经到顶或没有更多历史线索了）。
+        """
+        seen: dict[str, str] = {}
+        stale_rounds = 0
+        for _ in range(max_rounds):
+            new_this_round = 0
+            for lk in self._find_xiansuo_links(chat_scroll):
+                try:
+                    parent_val = str(getattr(lk.AXParent, "AXValue", "") or "")
+                except Exception:
+                    continue
+                h = hashlib.sha256(parent_val.encode()).hexdigest()
+                if h not in seen:
+                    new_this_round += 1
+                seen[h] = parent_val
+            if new_this_round == 0:
+                stale_rounds += 1
+                if stale_rounds >= 2:
+                    break
+            else:
+                stale_rounds = 0
+            self._scroll_chat_up_for_leads(chat_scroll, pid)
+            time.sleep(0.35)
+        logger.info("经营线索：滚动扫描累计发现 %d 条去重后的线索（含历史积压）", len(seen))
+        return seen
+
+    def _locate_lead_link_by_hash(self, chat_scroll, pid, lead_hash: str, max_rounds: int = 12):
+        """按 hash 定位可点击的'线索详情'AX 链接：先看当前视图，找不到就向上
+        滚动重试。用于替代旧的引用（虚拟化列表滚动后旧引用会失效）。"""
+        for i in range(max_rounds):
+            for lk in self._find_xiansuo_links(chat_scroll):
+                try:
+                    parent_val = str(getattr(lk.AXParent, "AXValue", "") or "")
+                except Exception:
+                    continue
+                if hashlib.sha256(parent_val.encode()).hexdigest() == lead_hash:
+                    return lk
+            if i < max_rounds - 1:
+                self._scroll_chat_up_for_leads(chat_scroll, pid)
+                time.sleep(0.35)
+        return None
+
     def _handle_jingying_leads(self, conv_row) -> None:
-        """经营线索处理：切到 conv → 列出所有线索 → 逐条遍历未处理的。
+        """经营线索处理：切到 conv → 滚动累积列出所有线索（含历史积压）→
+        逐条遍历未处理的。
 
         策略：
+        - **滚动累积扫描**：聊天区虚拟化，只看当前渲染行会漏掉被滚出可视区
+          的旧线索；这里反复滚动+扫描，直到连续两轮扫不到新内容才停，
+          保证历史积压的线索不会因为"新线索太多把旧的挤出可视区"而被漏发。
         - **文本级跳过（不进 popup）**：类型不在白名单 / 未加企微 →
           mark hash，一次扫完整个列表，不浪费 popup 时间。
         - **需 popup 的 lead**：每轮最多处理 _LEADS_MAX_PER_TICK 条
-          （避免占满 tick 影响普通客户消息），剩下下一轮再来。
+          （避免占满 tick 影响普通客户消息），剩下下一轮再来——不会丢，
+          只是排队，且每次都从"滚动累积扫描"里重新发现，不会因为只处理
+          最新几条就让队尾的旧线索永远轮不到。
         """
         logger.info("经营线索：开始处理线索…")
+
+        # 兜底：确保企微 AI 面板已关闭。经营线索弹窗查找用"最大非主窗口"兜底
+        # 策略，如果 AI 面板（同一 tick 内某条普通消息处理时可能没关成功）还
+        # 开着，会被误认成线索 popup，干扰经营线索处理。
+        if settings.wecom_ai_enabled:
+            try:
+                ai_panel.close_panel(self._get_app())
+            except Exception as exc:
+                logger.debug("经营线索前关闭 AI 面板兜底异常：%s", exc)
 
         if not self._switch_to_jingying_conv(conv_row):
             logger.warning("经营线索：切换 conv 失败，放弃本轮")
@@ -1624,26 +1822,20 @@ class WeChatWatcher:
             logger.warning("经营线索：未找到聊天滚动区")
             return
 
-        links = self._find_xiansuo_links(chat_scroll)
-        logger.info("经营线索：找到 %d 个线索详情链接", len(links))
-        if not links:
+        leads_by_hash = self._scan_leads_with_scroll(chat_scroll, pid)
+        if not leads_by_hash:
+            logger.info("经营线索：滚动扫描未发现任何线索")
             return
 
-        # 倒序遍历（最新在前），分两阶段：
-        # 阶段 1：扫所有 lead，能文本级跳过的直接标记，需 popup 的入队
-        popup_queue: list[tuple[object, str, str, str, str]] = []  # (lk, hash, parent_val, traveler, lead_type)
-        for lk in reversed(links):
-            try:
-                parent_val = str(getattr(lk.AXParent, "AXValue", "") or "")
-            except Exception:
-                continue
-            lead_hash = hashlib.sha256(parent_val.encode()).hexdigest()
-            # 类型先解析（用于业务级判重 key 和 logging）
+        # 阶段 1：扫所有 lead（含滚动扫到的历史积压），能文本级跳过的直接标记，
+        # 需 popup 的入队。dict 插入顺序＝发现顺序（当前视图最新的先发现），
+        # 近似"最新在前"，但完整性优先于严格顺序——重点是一条都不漏扫。
+        popup_queue: list[tuple[str, str, str, str]] = []  # (lead_hash, parent_val, traveler, lead_type)
+        for lead_hash, parent_val in leads_by_hash.items():
             lead_type = _parse_lead_type(parent_val)
             traveler_now = _parse_lead_message(parent_val)[0] or ""
             if self._lead_already_processed(lead_hash, lead_type, traveler_now):
                 continue
-            # 类型白名单
             if lead_type and lead_type not in LEAD_TYPE_WHITELIST:
                 self._mark_lead_processed(lead_hash, lead_type, traveler_now)
                 logger.info(
@@ -1659,59 +1851,50 @@ class WeChatWatcher:
                     traveler or "?",
                 )
                 continue
-            popup_queue.append((lk, lead_hash, parent_val, traveler, lead_type or ""))
+            popup_queue.append((lead_hash, parent_val, traveler, lead_type or ""))
 
         if not popup_queue:
             logger.info("经营线索：本轮无需 popup 处理的 lead（全部已跳过或处理过）")
             return
 
         logger.info(
-            "经营线索：本轮需 popup 处理 %d 条，将处理前 %d 条",
+            "经营线索：本轮需 popup 处理 %d 条（含历史积压），将处理前 %d 条，"
+            "剩余留到之后每轮继续排队，不会丢",
             len(popup_queue), min(len(popup_queue), self._LEADS_MAX_PER_TICK),
         )
 
-        # 阶段 2：依次走 popup 流程（每条之间重切回 经营线索 conv）
-        for idx, (lk, lead_hash, parent_val, traveler, lead_type) in enumerate(popup_queue):
+        # 阶段 2：依次走 popup 流程（每条之间重切回 经营线索 conv，并按 hash
+        # 重新定位可点击引用——虚拟化列表滚动后旧引用会失效，统一走"用时
+        # 现找"，不区分第一条和后续条目）。
+        for idx, (lead_hash, parent_val, traveler, lead_type) in enumerate(popup_queue):
             if idx >= self._LEADS_MAX_PER_TICK:
                 logger.info(
-                    "经营线索：本轮已 popup 处理 %d 条（上限 %d），剩 %d 条留下一轮",
+                    "经营线索：本轮已 popup 处理 %d 条（上限 %d），剩 %d 条留下一轮（不会丢）",
                     idx, self._LEADS_MAX_PER_TICK, len(popup_queue) - idx,
                 )
                 break
-            # 第二条起：每条之前重新切回 经营线索 conv（前一条流程可能切走了）
             if idx > 0:
                 if not self._switch_to_jingying_conv(conv_row):
                     logger.warning("经营线索：切回 conv 失败，剩余 %d 条放弃", len(popup_queue) - idx)
                     return
                 self._close_xiansuo_popups()
                 time.sleep(0.5)
-                # 重新找到这个 lead 的最新 AX node（hash 匹配）
                 try:
                     window = self._get_main_window()
                     chat_scroll = self._find_chat_scroll_area(window)
-                    if chat_scroll is None:
-                        logger.warning("经营线索：切回后未找到 chat scroll，剩 %d 条放弃", len(popup_queue) - idx)
-                        return
-                    fresh_links = self._find_xiansuo_links(chat_scroll)
-                    new_lk = None
-                    for fl in fresh_links:
-                        try:
-                            pv = str(getattr(fl.AXParent, "AXValue", "") or "")
-                            if hashlib.sha256(pv.encode()).hexdigest() == lead_hash:
-                                new_lk = fl
-                                break
-                        except Exception:
-                            continue
-                    if new_lk is None:
-                        logger.warning(
-                            "经营线索：切回后找不到 hash=%s 对应 link，跳过",
-                            lead_hash[:12],
-                        )
-                        continue
-                    lk = new_lk
-                except Exception as exc:
-                    logger.warning("经营线索：切回准备异常 %s，跳过本条", exc)
-                    continue
+                except Exception:
+                    chat_scroll = None
+                if chat_scroll is None:
+                    logger.warning("经营线索：切回后未找到 chat scroll，剩 %d 条放弃", len(popup_queue) - idx)
+                    return
+
+            lk = self._locate_lead_link_by_hash(chat_scroll, pid, lead_hash)
+            if lk is None:
+                logger.warning(
+                    "经营线索：找不到 hash=%s 对应的可点击链接（可能已被处理/清空），跳过",
+                    lead_hash[:12],
+                )
+                continue
 
             logger.info(
                 "经营线索：客户【已添加企微】✓ 类型=【%s】（旅客=%s, %d/%d）",
@@ -2331,11 +2514,22 @@ class WeChatWatcher:
     # Main loop
     # ------------------------------------------------------------------
 
+    # 非工作时间最后一条日志的时间戳，用于避免刷屏（每小时最多记一条）
+    _last_off_hours_log: float = 0.0
+
     def tick(self) -> None:
         """单次轮询：检查未读 → 提取 → 回复 → 记录。
 
         注意：全程后台运行，不抢占前台，不激活窗口。
         """
+        # 工作时间检查：非工作时间直接跳过，每小时最多记一条日志避免刷屏
+        if not settings.is_work_time():
+            now_ts = time.time()
+            if now_ts - self._last_off_hours_log > 3600:
+                logger.info("非工作时间，跳过本轮轮询（工作时间: %s, 工作日: %s）",
+                            settings.work_hours, settings.work_days)
+                self._last_off_hours_log = now_ts
+            return
         try:
             self._get_app()  # 仅获取引用，不 activate
         except Exception as exc:
@@ -2392,6 +2586,13 @@ class WeChatWatcher:
                 self._last_text_by_sender[sender] = msg["text"]
                 continue
 
+            # 只回复真实外部微信客户：无 "@微信" 标记的（群聊/服务号/系统/内部联系人）
+            # 在点开会话前就跳过——不抢焦点、不误回。经营线索/排除名单已在上面处理。
+            if settings.require_wechat_tag and not msg.get("has_wechat_tag"):
+                logger.info("非外部微信客户（无 @微信 标记），跳过 [%s]", sender[:40])
+                self._last_text_by_sender[sender] = msg["text"]
+                continue
+
             # 出方向欢迎语过滤：preview 无法区分出/入方向，企微在客户经理新加好友
             # 后会推欢迎语模板（"我已经添加了你..."、"尊敬的客户：感谢您选择南方航空..."），
             # 这些不是客户消息，bot 不应回复。
@@ -2423,6 +2624,11 @@ class WeChatWatcher:
                         "[%s] AX 读聊天面板失败，回退到预览处理（仅最后一条）",
                         sender,
                     )
+                # 学习飞轮：顺手采集真人纠正（复用刚读到的面板，零额外抢焦点）
+                try:
+                    self._harvest_corrections(sender)
+                except Exception as exc:
+                    logger.debug("harvest_corrections 异常：%s", exc)
             using_preview = not all_msgs  # 标记是否回退到了预览（WebArea 不可用）
             if not all_msgs:
                 all_msgs = [msg["text"]]
@@ -2438,14 +2644,23 @@ class WeChatWatcher:
                     self._last_text_by_sender[sender] = msg["text"]
                     continue
 
-            # 防自回环：计数式过滤。dq 已于上面清理过期项。
+            # 防自回环：计数式过滤（echo_protect_seconds 时间窗内的最近回复）+
+            # 永久性 bot_sent_texts 兜底（不限时间）。
+            # 背景：AX 按气泡 x 坐标判断左右方向，超长消息偶尔会被误判成"客户"
+            # 方向（实测发生过——bot 自己发的长回复被当成新客户消息又回复了
+            # 一次）。仅靠时间窗防不住"发送时间超过 echo_protect_seconds"或
+            # "daemon 重启导致内存里的时间窗记录丢失"这两种情况，这里额外用
+            # 不限时的 bot_sent_texts（按内容精确匹配）兜底，双重保险。
             from collections import Counter as _C
             my_counts = _C(text for _, text in (dq or []))
+            bot_ever_sent = self._bot_sent_texts.get(sender, set())
 
             filtered_msgs: list[str] = []
             for m in reversed(all_msgs):
                 if my_counts.get(m, 0) > 0:
                     my_counts[m] -= 1
+                    continue
+                if m in bot_ever_sent:
                     continue
                 filtered_msgs.append(m)
             filtered_msgs.reverse()
@@ -2501,13 +2716,49 @@ class WeChatWatcher:
             except Exception as exc:
                 logger.debug("读取历史对话失败：%s", exc)
 
+            # 企微内置 AI 面板优先：rules 命中失败时先试面板（面板自己读聊天记录生成
+            # 回复），面板交互失败/未开启才回退到原 RAG/LLM 链路。
+            result = None
+            if settings.wecom_ai_enabled:
+                quick_rule = rules.match(combined_text)
+                if quick_rule is not None:
+                    result = {"source": "rules", "content": quick_rule}
+                else:
+                    # 兜底：确保没有残留的经营线索详情弹窗——那类弹窗也是非主
+                    # 窗口，跟 AI 面板一样会被 ai_panel._panel_window() 的
+                    # "第一个非'企业微信'标题的窗口"逻辑误认成 AI 面板，
+                    # 导致后续找 chip/输入框全部找错窗口。跟经营线索处理前
+                    # 强制关 AI 面板是对称的兜底。
+                    try:
+                        self._close_xiansuo_popups()
+                    except Exception as exc:
+                        logger.debug("AI 面板调用前关闭经营线索弹窗兜底异常：%s", exc)
+                    self._send_quick_ack(msg["conv_row"], sender)
+                    try:
+                        ai_reply, ai_needs_manual = ai_panel.generate_reply(
+                            self._get_app(),
+                            _get_wecom_pid(settings.wecom_bundle_id),
+                            sender,
+                            timeout=settings.wecom_ai_timeout_seconds,
+                        )
+                    except Exception as exc:
+                        logger.warning("企微 AI 面板生成回复异常，回退原链路：%s", exc)
+                        ai_reply, ai_needs_manual = None, False
+                    if ai_reply:
+                        result = {
+                            "source": "wecom_ai",
+                            "content": ai_reply,
+                            "needs_manual": ai_needs_manual,
+                        }
+
             # 引擎用合并文本做匹配；LLM 收到上下文 + 历史
-            result = engine.process_message(
-                combined_text,
-                sender_id=sender,
-                context=all_msgs,
-                history=history,
-            )
+            if result is None:
+                result = engine.process_message(
+                    combined_text,
+                    sender_id=sender,
+                    context=all_msgs,
+                    history=history,
+                )
 
             if result["source"] == "none":
                 logger.info("无匹配规则/废话库/LLM，跳过回复 [%s]: %s",
@@ -2548,8 +2799,11 @@ class WeChatWatcher:
             latency_ms = int((time.monotonic() - t_start) * 1000)
             if sent:
                 self._daily.record_reply(result.get("source") or "")
-                # 客户消息含选座/改签/退票/升舱/查里程等"需人工"关键词 → 发邮件提醒
-                manual_alert.maybe_alert(sender, combined_text, result["content"])
+                # 客户消息含选座/改签/退票/升舱/查里程等"需人工"关键词 → 发邮件提醒；
+                # wecom_ai 来源时若 AI 自己判断这条需转人工（needs_manual），即使
+                # 客户原话没命中正则也强制提醒——两条信号独立，任一命中都发邮件。
+                force_kw = "AI判断需人工处理" if result.get("needs_manual") else None
+                manual_alert.maybe_alert(sender, combined_text, result["content"], force_keyword=force_kw)
                 self._processed.add(msg["msg_hash"])
                 # 内容级去重：记录本次回复的消息集合，下次见到相同集合直接跳过
                 self._last_replied_batch[sender] = content_batch
@@ -2606,6 +2860,20 @@ class WeChatWatcher:
             if last_leads_save >= 6:
                 _save_processed_leads(self._processed_leads, self._processed_lead_prefixes, self._processed_lead_traveler_keys)
                 last_leads_save = 0
+            # 定时主动扫描经营线索
+            # 即使经营线索会话没有未读消息，也主动去处理历史线索
+            if settings.leads_proactive_interval > 0:
+                leads_proactive_counter = getattr(self, '_leads_proactive_counter', 0) + 1
+                self._leads_proactive_counter = leads_proactive_counter
+                if leads_proactive_counter >= settings.leads_proactive_interval:
+                    self._leads_proactive_counter = 0
+                    conv_row = self._find_jingying_conv_row()
+                    if conv_row is not None:
+                        logger.info("定时主动扫描经营线索…")
+                        try:
+                            self._handle_jingying_leads(conv_row)
+                        except Exception as exc:
+                            logger.error("定时经营线索处理异常：%s", exc)
             # 切片睡眠：响应优雅退出更快，最多多睡 0.5s
             slept = 0.0
             while slept < settings.poll_interval_seconds and not self._should_stop:

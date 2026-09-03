@@ -19,13 +19,15 @@ build/
 .DS_Store
 Thumbs.db
 
-# 日志
+# 日志：当前 daemon.log 在仓库里历史遗留，但轮转的 .1~.N 绝不能上 GitHub
 *.log
+daemon.log.*
 logs/
 
 # IDE
 .vscode/
 .idea/
+.workbuddy/
 
 # 运行时产物
 .daemon.pid
@@ -34,3 +36,31 @@ ax_tree.txt
 storage/heartbeat.txt
 storage/processed_leads.json
 storage/leads_sent.jsonl
+
+# ── 用户数据：只留在本地，不上 GitHub ─────────────────────────────
+# 跟 Hermes Agent 一样的契约：代码/配置上 GitHub，从真实客户/会话
+# 采集的语料/记录只留在本地机器，绝不进入仓库历史。
+#
+# 理由：data/learned_qa.jsonl 由 bot 读取真实客户会话面板累积而来，
+# 其中可能含客户姓名、订单号、行程等敏感信息；storage/ 下的
+# 运行时记录同理。一次疏忽泄露不可撤销，所以默认全 ignore。
+data/learned_qa.jsonl
+data/learned_qa.jsonl.*
+storage/heartbeat.txt
+storage/processed_leads.json
+storage/processed_leads.json.*
+storage/leads_sent.jsonl
+storage/leads_sent.jsonl.*
+storage/messages.db
+storage/messages.db.*
+storage/qa_pairs_*.jsonl
+storage/embeddings_*.npy
+data/rag_index/*/embeddings.npy
+data/rag_index/*/metadata.jsonl
+data/rag_index/*/embeddings.npy.tmp
+
+# 一次性脚本（硬编码个人路径，不属于产品代码）
+scripts/oneoff/
+
+# 允许入仓的空模板：data/learned_qa.jsonl.example（真实数据 learned_qa.jsonl 已 ignore）
+!data/learned_qa.jsonl.example

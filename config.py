@@ -1,4 +1,42 @@
+import re
+from datetime import datetime, time
+from typing import Optional
+
 from pydantic_settings import BaseSettings
+
+
+def _parse_work_hours(raw: str) -> list[tuple[time, time]]:
+    """解析工作时间字符串为 (start, end) 列表。
+
+    格式："08:30-12:01,14:00-17:31"
+    空字符串 → 空列表（表示 24 小时）。
+    """
+    if not raw or not raw.strip():
+        return []
+    slots = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", part)
+        if not m:
+            raise ValueError(f"工作时间格式错误：{part!r}，应为 HH:MM-HH:MM")
+        slots.append((
+            time.fromisoformat(m.group(1)),
+            time.fromisoformat(m.group(2)),
+        ))
+    return slots
+
+
+def _parse_work_days(raw: str) -> set[int]:
+    """解析工作日字符串为星期几集合。
+
+    格式："0,1,2,3,4"（0=周一, 6=周日）
+    空字符串 → 空集合（表示每天）。
+    """
+    if not raw or not raw.strip():
+        return set()
+    return {int(d.strip()) for d in raw.split(",") if d.strip()}
 
 
 class Settings(BaseSettings):
@@ -19,12 +57,26 @@ class Settings(BaseSettings):
     qwen_api_key: str = ""
     mimo_api_key: str = ""
 
+    # ── 第三层兜底：OpenRouter（mimo、moonshot 都失败后再试） ──
+    openrouter_api_key: str = ""
+    openrouter_model: str = "deepseek/deepseek-v4-flash"
+
+    # ── 学习飞轮：被动捕获真人客户经理的纠正/补答为 QA 候选 ──
+    # 开启后，bot 读会话面板时顺手采集"真人手打、非 bot 发"的回复入 learned_qa.jsonl，
+    # 供后续评分/审核 → 增量嵌入进 RAG。纯采集，不影响回复逻辑。
+    learn_capture_enabled: bool = True
+
     # ── 向后兼容（旧字段，供已有 .env 文件过渡用） ──────────
     claude_api_key: str = ""
     claude_model: str = "claude-haiku-4-5"
 
     # ── 废话库 ───────────────────────────────────────────────
     filler_enabled: bool = False   # 无规则命中时从废话库随机抽取
+
+    # ── LLM 全部失败时的保底话术 ─────────────────────────────
+    # 当 mimo 与 moonshot 兜底都连不上时，不再静默跳过，而是发这句安抚话术，
+    # 让客户知道消息已收到、有人会跟进。设为空字符串则恢复旧的静默行为。
+    llm_fallback_reply: str = "稍等一下哈，马上回复您～"
 
     # ── 回复延迟（随机扰动） ─────────────────────────────────
     reply_delay_min_seconds: float = 1.0
@@ -40,8 +92,17 @@ class Settings(BaseSettings):
     # 静默发送：发送回复时不抢焦点；失败再回退到激活窗口
     silent_send: bool = False
 
+    # 经营线索定时主动扫描间隔（tick 数），默认 120 tick ≈ 10 分钟
+    # 设为 0 则禁用定时扫描，只在经营线索有未读消息时处理
+    leads_proactive_interval: int = 120
+
     # 群聊自动回复：默认关闭，避免群里被 @ 时给所有人刷屏
     group_chat_reply: bool = False
+
+    # 只回复真实外部微信客户（会话带 "@微信" 标记）。
+    # 企微里群聊、在线客服/智能客服、经营线索、系统通知、内部联系人等都没有这个标记，
+    # 开启后这些在"点开会话"之前就被跳过，彻底不抢焦点、不误回。默认开启。
+    require_wechat_tag: bool = True
 
     # LLM 速率限制：同一客户每分钟最多调用 N 次，超出改走 filler 或跳过
     llm_rate_limit_per_minute: int = 6
@@ -55,6 +116,13 @@ class Settings(BaseSettings):
     # 自回环防护时长（秒）：我方刚发过的同一文本，在此窗口内若被 AX 读到视为自己的消息。
     # 超过此窗口后，对方若真发相同文本会被正常处理。
     echo_protect_seconds: float = 120.0
+
+    # ── 企微内置 AI 面板回复（实验性） ─────────────────────────
+    # 开启后：rules 命中失败时，优先用企微自带 AI 助手(热键唤出面板，
+    # 附加当前客户完整聊天记录为 context，令其自己读)生成回复；
+    # 面板交互失败（找不到控件/超时）才回退到下面的 RAG/LLM 链路。
+    wecom_ai_enabled: bool = False
+    wecom_ai_timeout_seconds: float = 30.0
 
     # ── RAG（按客户经理蒸馏的话术库） ─────────────────────────
     # 总开关；为 True 时 engine 在 rules 之后插入 RAG 层
@@ -72,6 +140,14 @@ class Settings(BaseSettings):
     # 会话名字包含任一关键词（大小写不敏感）将被跳过，不回复。
     # 在 .env 里用英文逗号分隔：EXCLUDED_SENDERS=经营线索,客户联系,邮件提醒
     excluded_senders: str = "经营线索,客户联系,邮件提醒,企业微信团队,文件传输助手,明珠智企"
+
+    # ── 工作时间（仅在此时间段内自动回复） ───────────────────
+    # 格式：HH:MM 24 小时制。支持多个时段（上午/下午），用逗号分隔。
+    # 例："08:30-12:01,14:00-17:31" 表示上午 8:30~12:01、下午 14:00~17:31。
+    # 设为空字符串则 24 小时回复。
+    work_hours: str = "08:30-12:01,14:00-17:31"
+    # 工作日：0=周一 ... 6=周日。设为空字符��则每天。
+    work_days: str = "0,1,2,3,4"
 
     # ── 每日邮件报表 ─────────────────────────────────────────
     # 每日 0 点把"昨日"汇总（回复/失败/线索条数）通过 SMTP 发到目标邮箱
@@ -136,6 +212,24 @@ class Settings(BaseSettings):
             "custom": "",
         }
         return defaults.get(self.llm_provider, self.claude_model)
+
+    def is_work_time(self, now: Optional[datetime] = None) -> bool:
+        """判断当前是否在工作时间（工作日 + 工作时段）内。
+
+        工作时间配置为空字符串时视为 24 小时 / 每天，始终返回 True。
+        """
+        if now is None:
+            now = datetime.now()
+        # 工作日检查
+        work_days = _parse_work_days(self.work_days)
+        if work_days and now.weekday() not in work_days:
+            return False
+        # 时段检查
+        slots = _parse_work_hours(self.work_hours)
+        if not slots:
+            return True  # 未配置 = 24 小时
+        current = now.time()
+        return any(start <= current <= end for start, end in slots)
 
 
 settings = Settings()

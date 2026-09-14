@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # 静默发送：发送回复时不抢焦点；失败再回退到激活窗口
     silent_send: bool = False
 
+    # 桌面控制阶梯：优先 AX / PostToPid 后台操作，读取状态确认失败后才允许前台兜底。
+    # background_mode=False 保留旧的直接前台路径，便于紧急回滚。
+    background_mode: bool = True
+    allow_foreground_fallback: bool = True
+
     # 经营线索定时主动扫描间隔（tick 数），默认 120 tick ≈ 10 分钟
     # 设为 0 则禁用定时扫描，只在经营线索有未读消息时处理
     leads_proactive_interval: int = 120

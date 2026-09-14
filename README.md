@@ -35,6 +35,24 @@
 | `reply/manual_alert.py` | 选座/改签等"需人工处理"关键词检测 + 邮件提醒 |
 | `rules.json` / `fillers.json` | 规则库 / 废话库 |
 
+## 后台控制模式
+
+普通客户会话默认采用后台优先阶梯：`AXPress/AXSelected` → `CGEventPostToPid` →
+读取当前聊天标题验证；只有确认后台操作无效后，才允许短暂激活企业微信前台兜底。
+发送回复也会先用 PID 定向点击和回车，并以输入框清空作为发送成功依据。
+
+```dotenv
+BACKGROUND_MODE=true
+ALLOW_FOREGROUND_FALLBACK=true
+```
+
+- `BACKGROUND_MODE=true`：启用后台优先模式。
+- `ALLOW_FOREGROUND_FALLBACK=true`：后台验证失败时允许短暂抢前台，可靠性优先。
+- 将 `ALLOW_FOREGROUND_FALLBACK=false` 可设为严格后台模式；后台操作失败时放弃本轮、
+  记录日志并等待下轮，不会激活企业微信。
+- 企微内置 AI 面板的唤出快捷键是系统级全局快捷键，无法承诺完全隐形；普通会话
+  切换和发送不受此限制。
+
 ## 企微内置 AI 回复（实验性，2026-07-07 上线）
 
 `WECOM_AI_ENABLED=true` 时，rules 命中失败后优先用**企微自带 AI 助手面板**

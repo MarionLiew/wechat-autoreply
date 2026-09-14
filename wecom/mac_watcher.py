@@ -40,6 +40,11 @@ from reply import engine, manual_alert, rules
 from storage import leads_log, mailer, message_log
 from storage.daily_stats import DailyTracker
 from wecom import ai_panel
+from wecom.desktop_driver import (
+    ActionEffect,
+    BackgroundDesktopDriver,
+    foreground_fallback_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -648,27 +653,25 @@ class WeChatWatcher:
 
         pid = _get_wecom_pid(settings.wecom_bundle_id)
 
-        for attempt in range(attempts):
-            # 每次重试前重新定位 conv_row（避免 conv_list 重渲染导致的 stale ref）。
-            # 不传 expected_sender 时无法重新定位，回退用传入的 row。
+        # 每条路径执行前重定位，避免会话列表重渲染后使用 stale AX row。
+        def _fresh_row():
+            nonlocal conv_row
             if expected_sender:
                 fresh = self._find_conv_row_by_sender(expected_sender)
                 if fresh is not None:
                     conv_row = fresh
+            return conv_row
 
-            # 切换会话——直接用 osascript activate+click（最可靠），WeCom 在某些
-            # 状态下不响应 PostToPid 静默事件，激活前台后真鼠标点击是确定生效的方式。
-            # 副作用：WeCom 会被瞬间拉前台。
-            _osascript_click_conv_row(conv_row)
-            pressed = True
+        seen: set[str] = set()
+        covering_panel = False
 
+        def _verify() -> bool:
+            """轮询 AX 状态；输入调用的返回值不作为成功依据。"""
+            nonlocal covering_panel
             if not sender_core:
                 time.sleep(1.0)
                 return True
-
             deadline = time.monotonic() + per_attempt_timeout
-            seen: set[str] = set()
-            covering_panel = False  # 此次轮询是否看到功能浮层遮挡迹象
             while time.monotonic() < deadline:
                 try:
                     window = self._get_main_window()
@@ -679,42 +682,52 @@ class WeChatWatcher:
                 if cur:
                     seen.add(cur)
                     if cur == sender_core or sender_core in cur or cur in sender_core:
-                        logger.info(
-                            "切换到 [%s] 成功（panel desc=%r，第 %d 次）",
-                            expected_sender, cur, attempt + 1,
-                        )
                         return True
                 else:
-                    # 当前没有"非功能浮层"的 chat WebArea；看一下是不是被功能浮层完全遮住
                     descs = _all_descs(window)
                     if descs and any(d in self._FUNCTION_PANEL_DESCS for d in descs):
                         covering_panel = True
                 time.sleep(0.2)
 
-            logger.warning(
-                "切换到 [%s] 失败：%.1fs 内 panel desc 未匹配（core=%r seen=%s 浮层遮挡=%s），第 %d/%d 次",
-                expected_sender, per_attempt_timeout, sender_core,
-                sorted(seen)[:5], covering_panel, attempt + 1, attempts,
-            )
-
-            # 失败后若仍有重试机会，且检测到功能浮层遮挡，先折叠再下一轮
-            if attempt + 1 < attempts and covering_panel:
+            if covering_panel:
                 try:
                     window = self._get_main_window()
                     if self._try_dismiss_covering_panel(window):
-                        logger.info("[%s] 已尝试关闭浮层，等待重试切换", expected_sender)
-                        time.sleep(1.2)  # 等关闭动画 + 聊天面板重新渲染
-                    else:
-                        logger.warning(
-                            "[%s] 浮层关闭失败，下一轮切换可能仍受遮挡",
-                            expected_sender,
-                        )
+                        logger.info("[%s] 已关闭遮挡浮层，继续后台切换阶梯", expected_sender)
+                        time.sleep(1.2)
                 except Exception as exc:
                     logger.debug("关闭浮层异常：%s", exc)
+            return False
+
+        # background_mode=False 是紧急兼容开关：直接走原来的前台点击。
+        if not settings.background_mode:
+            delivered = _osascript_click_conv_row(_fresh_row())
+            success = bool(delivered and _verify())
+            method = "foreground-legacy"
+        else:
+            driver = BackgroundDesktopDriver(
+                ax_action=lambda: _press_conv_row(_fresh_row()),
+                pid_action=lambda: _force_click_conv_row(_fresh_row(), pid),
+                foreground_action=lambda: _osascript_click_conv_row(_fresh_row()),
+                verify=_verify,
+                allow_foreground_fallback=settings.allow_foreground_fallback,
+            )
+            result = driver.perform()
+            success = result.effect == ActionEffect.CONFIRMED
+            method = result.method
+
+        if success:
+            logger.info(
+                "切换到 [%s] 成功（方式=%s，seen=%s，前台兜底=%s）",
+                expected_sender or "?", method, sorted(seen)[:5],
+                method.startswith("foreground"),
+            )
+            return True
 
         logger.error(
-            "[%s] 多次切换会话仍未让 panel 与目标 sender 一致，放弃此次操作",
-            expected_sender,
+            "[%s] 会话切换失败（seen=%s，浮层遮挡=%s，后台模式=%s，允许前台兜底=%s）",
+            expected_sender or "?", sorted(seen)[:5], covering_panel,
+            settings.background_mode, settings.allow_foreground_fallback,
         )
         return False
 
@@ -769,7 +782,9 @@ class WeChatWatcher:
         except Exception as exc:
             logger.warning("查找未读会话失败：%s", exc)
             # AXTable 找不到通常是窗口最小化/隐藏，尝试 activate 拉到前台
-            if "AXTable" in str(exc):
+            if "AXTable" in str(exc) and foreground_fallback_enabled(
+                settings.background_mode, settings.allow_foreground_fallback
+            ):
                 now = time.time()
                 if now - self._last_axtable_activate_ts > 30:
                     self._last_axtable_activate_ts = now
@@ -1217,6 +1232,8 @@ class WeChatWatcher:
             if not str(getattr(c, "AXValue", "") or "").strip()
         ]
         input_box = (empty_candidates[-1] if empty_candidates else candidates[-1])
+        pos = None
+        sz = None
         try:
             pos = getattr(input_box, "AXPosition", None)
             sz = getattr(input_box, "AXSize", None)
@@ -1385,7 +1402,12 @@ class WeChatWatcher:
             # ② Spotlight 等效重新激活：`open -a 企业微信` 触发 OS 级 LSOpen，
             # 经营大厅浮层在此次激活中常被自动 dismiss / 焦点重置。
             # 之后重新 PostToPid 点输入框，必要时补写，再 keystroke return。
-            if not enter_method and pid and pos and sz:
+            if (
+                not enter_method and pid and pos and sz
+                and foreground_fallback_enabled(
+                    settings.background_mode, settings.allow_foreground_fallback
+                )
+            ):
                 try:
                     import subprocess
                     subprocess.run(

@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import random
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -156,6 +157,9 @@ class WeChatWatcher:
         self._daily = DailyTracker()
         # WeCom 应用获取失败计数：连续 N 次后用 `open -a` 自愈
         self._app_fail_streak = 0
+        # AXWindows 可能在 app 引用可获取时持续失效，必须独立计数，不能让
+        # _get_app() 的成功获取把窗口故障状态清零。
+        self._window_fail_streak = 0
 
     def request_stop(self) -> None:
         """从外部（信号处理器）请求优雅退出。当前 tick 完成后退出。"""
@@ -226,14 +230,43 @@ class WeChatWatcher:
         try:
             windows = app.AXWindows
         except Exception as exc:
-            # 企业微信卡退/重启后 PID 变了，缓存的 app 引用变陈旧，AXWindows 会一直抛错。
-            # 这里重置缓存引用，下一轮 _get_app() 会按 bundle_id 重新拿到新进程的引用，
-            # 让 daemon 在企微崩溃重启后能自动恢复，无需手动重启。
+            # app 引用可获取但 AXWindows 持续失效时，_get_app() 每轮成功会让旧的
+            # app 失败计数失去意义。因此窗口枚举故障必须单独累计并主动验证恢复。
+            self._window_fail_streak += 1
             self._app = None
-            raise RuntimeError("无法枚举企业微信窗口（已重置 app 引用，下轮重连）") from exc
+            if self._window_fail_streak < 3:
+                raise RuntimeError(
+                    "无法枚举企业微信窗口（已重置 app 引用，下轮重连）"
+                ) from exc
+
+            logger.warning(
+                "连续 %d 次无法枚举企业微信窗口，尝试按 bundle id 重新拉起",
+                self._window_fail_streak,
+            )
+            try:
+                result = subprocess.run(
+                    ["open", "-b", settings.wecom_bundle_id],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "open 返回非零状态")
+                time.sleep(4.0)
+                recovered_app = atomacos.getAppRefByBundleId(settings.wecom_bundle_id)
+                windows = recovered_app.AXWindows
+                if not windows:
+                    raise RuntimeError("重新拉起后仍无可枚举窗口")
+                self._app = recovered_app
+                self._window_fail_streak = 0
+                logger.info("窗口自愈成功：企业微信 AXWindows 已恢复")
+            except Exception as recovery_exc:
+                self._app = None
+                raise RuntimeError(
+                    f"企业微信窗口自愈失败（连续 {self._window_fail_streak} 次无法枚举）"
+                ) from recovery_exc
+        else:
+            self._window_fail_streak = 0
         if not windows:
             # 窗口最小化或隐藏 → 自动激活拉起
-            import subprocess
             logger.info("企业微信无窗口，尝试 activate 拉起…")
             subprocess.run(
                 ["open", "-b", settings.wecom_bundle_id],

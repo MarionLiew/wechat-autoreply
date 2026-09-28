@@ -2612,6 +2612,18 @@ class WeChatWatcher:
             if sender not in current_unread_senders:
                 self._last_text_by_sender.pop(sender, None)
 
+        # ── 我方群发识别：同一预览文本同时出现在 ≥3 个会话 = 客户经理群发 ──
+        # 这类"未读"不是客户来信，绝不能为它们启动企微 AI 面板（热键全局弹出、
+        # 来回一趟几十秒，纯打扰）。识别后整个 daemon 生命周期内该文本都算群发。
+        from collections import Counter as _C2
+        preview_counts = _C2(m.get("text", "") for m in parsed)
+        _bcast = getattr(self, "_broadcast_texts", None)
+        if _bcast is None:
+            _bcast = self._broadcast_texts = set()
+        for text, cnt in preview_counts.items():
+            if text and cnt >= 3:
+                _bcast.add(text)
+
         # ── 分两阶段处理：先普通消息回复，再经营线索 ──
         # 经营线索 handler 会切走 WeCom UI 到线索频道，如果在循环中间执行，
         # 后续普通消息的 send_reply 会把回复发到错误会话。
@@ -2647,6 +2659,16 @@ class WeChatWatcher:
             if settings.require_wechat_tag and not msg.get("has_wechat_tag"):
                 logger.info("非外部微信客户（无 @微信 标记），跳过 [%s]", sender[:40])
                 self._last_text_by_sender[sender] = msg["text"]
+                continue
+
+            # 我方群发（同一文本在 ≥3 个会话同时出现）：不读面板、不启动 AI，直接跳过。
+            if getattr(self, "_broadcast_texts", None) and msg["text"] in self._broadcast_texts:
+                logger.info(
+                    "跳过 [%s]：预览与 %d 个会话相同，判定为我方群发（不启动企微 AI）",
+                    sender, preview_counts.get(msg["text"], 0),
+                )
+                self._last_text_by_sender[sender] = msg["text"]
+                self._processed.add(msg["msg_hash"])
                 continue
 
             # 出方向欢迎语过滤：preview 无法区分出/入方向，企微在客户经理新加好友

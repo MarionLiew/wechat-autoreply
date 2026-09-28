@@ -96,7 +96,7 @@ class NativeAIResult(NamedTuple):
 _NO_INBOUND_EVIDENCE = re.compile(
     "|".join([
         r"(?:没有|并没有|没|无|没有任何).{0,12}来自.{0,40}(?:的消息|消息)",
-        r"(?:对方|客户).{0,20}(?:没有|没).{0,12}(?:任何|新)?消息",
+        r"(?:对方|客户).{0,42}(?:没有|没).{0,12}(?:任何|新)?消息",
         r"(?:此后|之后|后来).{0,12}(?:客户|对方).{0,10}(?:没有|没).{0,5}消息",
         r"没有(?:任何)?(?:新)?消息需要(?:回复|应答|拟)",
         r"没有(?:任何)?需要(?:回复|应答)的内容",
@@ -105,7 +105,7 @@ _NO_INBOUND_EVIDENCE = re.compile(
 )
 _OUR_MESSAGE_EVIDENCE = re.compile(
     "|".join([
-        r"(?:最近|最新|最后).{0,15}(?:的)?(?:两条|几条|一条|任何)?消息.{0,25}(?:都是|均为|是)(?:你|您|我|我方|自己|你这边|我这边).{0,10}发",
+        r"(?:最近|最新|最后).{0,15}(?:的)?(?:两条|几条|一条|任何)?消息.{0,25}(?:都是|均为|均是|是)(?:你|您|我|我方|自己|你这边|我这边).{0,10}发",
         r"(?:最近|最新|最后).{0,40}由(?:你|您|我|我方|自己).{0,30}发出",
         r"(?:最近|最新|最后).{0,30}(?:你是|我是|我方|你这边|我这边).{0,20}发出",
         r"(?:你|您|我|我方|自己|你这边|我这边).{0,10}(?:发出的|发的)",
@@ -115,7 +115,7 @@ _OUR_MESSAGE_EVIDENCE = re.compile(
 
 def classify_response(raw: str) -> NativeAIResult:
     """Distinguish no inbound message from a malformed/failed AI reply."""
-    if raw.strip() == _NO_INBOUND:
+    if raw and _NO_INBOUND in raw:
         return NativeAIResult("no_inbound")
     # A correctly delimited reply wins over incidental mentions of the same words
     # inside the customer's question or the AI's answer.

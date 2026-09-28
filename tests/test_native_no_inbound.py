@@ -120,6 +120,46 @@ def test_real_production_no_inbound_phrasings():
         "再没有发过任何消息。最近几条消息都是你这边发出的——昨晚的中秋祝福，以及刚刚的[玫瑰]。",
         "聊天记录显示，最近两条消息都是我发出的：\n1. 2026-09-24 中秋祝福\n2. 刚才的[玫瑰]\n客户在此之后没有新消息。",
         "目前这个对话中，只有您这边发出的两条消息（昨天的中秋祝福和刚才的[玫瑰]），客户\"休闲小猫\"并没有发送过任何消息过来。所以暂时没有需要回复的客户消息。",
+        "根据聊天记录分析：\n最近两条消息均是我方发出的：\n客户（Liana Jin / 高女士）在这之后没有新消息。\n===无客户消息===",
     ]
     for sample in samples:
         assert ai_panel.classify_response(sample).status == "no_inbound", sample[:50]
+        if "===无客户消息===" in sample:
+            assert ai_panel.classify_response(sample.replace("\n===无客户消息===", "")).status == "no_inbound"
+
+
+def test_broadcast_text_in_four_conversations_skips_all_without_panel():
+    from unittest.mock import MagicMock
+    watcher = object.__new__(WeChatWatcher)
+    watcher._last_text_by_sender = {}
+    watcher._recent_replies_by_sender = {}
+    watcher._bot_sent_texts = {}
+    watcher._last_replied_batch = {}
+    watcher._processed = set()
+    watcher._daily = MagicMock()
+    watcher._broadcast_texts = set()
+    text = "无论您是刚刚降落，还是即将起飞，愿您的心先一步抵达团圆。"  # 客户经理群发
+    convs = [object() for _ in range(4)]
+    msgs = [
+        {"sender_id": f"客户{i}(男)-{i}", "text": text, "has_wechat_tag": True,
+         "conv_row": c, "msg_hash": f"h{i}"}
+        for i, c in enumerate(convs)
+    ]
+    with patch.object(Settings, "is_work_time", return_value=True), \
+         patch.object(WeChatWatcher, "_get_app", return_value=object()), \
+         patch.object(WeChatWatcher, "find_unread_conversations", return_value=convs), \
+         patch.object(WeChatWatcher, "extract_last_message", side_effect=msgs), \
+         patch.object(WeChatWatcher, "_unread_count", return_value=1), \
+         patch.object(WeChatWatcher, "_is_outgoing_template", return_value=False), \
+         patch.object(WeChatWatcher, "read_last_messages") as read_local, \
+         patch.object(WeChatWatcher, "_harvest_corrections"), \
+         patch("wecom.mac_watcher.message_log"), \
+         patch("wecom.mac_watcher.ai_panel.generate_reply") as native, \
+         patch("wecom.mac_watcher.engine.process_message") as fallback, \
+         patch.object(WeChatWatcher, "send_reply") as send:
+        watcher.tick()
+    read_local.assert_not_called()
+    native.assert_not_called()
+    fallback.assert_not_called()
+    send.assert_not_called()
+    assert len(watcher._processed) == 4

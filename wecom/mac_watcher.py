@@ -2671,15 +2671,24 @@ class WeChatWatcher:
             read_n = min(unread_n + bot_in_window + 2, 30)
 
             all_msgs: list[str] = []
-            if unread_n >= 2 or bot_in_window > 0:
-                all_msgs = self.read_last_messages(
-                    msg["conv_row"], read_n, expected_sender=sender,
-                )
-                if not all_msgs:
-                    logger.warning(
-                        "[%s] AX 读聊天面板失败，回退到预览处理（仅最后一条）",
+            # 先本地读取聊天面板，用气泡左右方向判断最近消息是谁发的。
+            # 确认为我方发出的（群发/表情/模板）就直接跳过——绝不启动企微 AI 面板
+            # （面板热键是系统级全局的，会弹出窗口打扰屏幕，且来回一趟要几十秒）。
+            all_msgs = self.read_last_messages(
+                msg["conv_row"], read_n, expected_sender=sender,
+            )
+            if not all_msgs:
+                stash = getattr(self, "_last_panel_directional", None)
+                directional = stash[1] if stash and stash[0] == sender else None
+                if directional and all(item["side"] == "out" for item in directional):
+                    logger.info(
+                        "跳过 [%s]：本地方向读取确认最近消息均为我方发出（不启动企微 AI）",
                         sender,
                     )
+                    self._last_text_by_sender[sender] = msg["text"]
+                    self._processed.add(msg["msg_hash"])
+                    continue
+                logger.debug("[%s] AX 读聊天面板失败或方向不明，回退预览处理", sender)
                 # 学习飞轮：顺手采集真人纠正（复用刚读到的面板，零额外抢焦点）
                 try:
                     self._harvest_corrections(sender)

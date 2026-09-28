@@ -81,3 +81,16 @@ def test_formatted_reply_is_success():
 def test_formatted_customer_quote_is_not_mistaken_for_no_inbound():
     raw = "===回复正文开始===\n您说最近没有来自航司的消息，最近两条消息都是你发出的，我帮您核实。\n===回复正文结束==="
     assert ai_panel.classify_response(raw).status == "reply"
+
+
+def test_real_production_no_inbound_phrasings():
+    """Live phrasing from today's daemon.log: prose verdicts, no delimiter."""
+    samples = [
+        "根据聊天记录，最近一条消息是 2026-09-24 17:55:54 由我方（南航高端客户经理-小明(刘明瑞)）发出的中秋祝福，此后客户没有新消息。",
+        "我已阅读完聊天记录。最后一条消息是2026-09-24 17:55:54我方发出的中秋祝福，客户在此之后没有新消息。",
+        "根据聊天记录，最近一条消息是 2026-09-24 17:55:54 我方（南航高端客户经理-小明）发出的中秋祝福，该消息之后客户 Liana Jin 没有任何新消息。",
+        "再没有发过任何消息。最近几条消息都是你这边发出的——昨晚的中秋祝福，以及刚刚的[玫瑰]。",
+        "目前这个对话中，只有您这边发出的两条消息（昨天的中秋祝福和刚才的[玫瑰]），客户\"休闲小猫\"并没有发送过任何消息过来。所以暂时没有需要回复的客户消息。",
+    ]
+    for sample in samples:
+        assert ai_panel.classify_response(sample).status == "no_inbound", sample[:50]

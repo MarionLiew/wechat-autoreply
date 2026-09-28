@@ -90,6 +90,29 @@ class NativeAIResult(NamedTuple):
     needs_manual: bool = False
 
 
+# 大圆有时不按定界符/标记输出，而是用一段话说明"最近没有客户消息"，
+# 这些措辞都表明它是方向结论而不是生成失败。no_inbound 判定需两条都成立：
+# ① 客户侧没有新消息；② 最近的发言是我方。两条都命中才跳过，避免误判。
+_NO_INBOUND_EVIDENCE = re.compile(
+    "|".join([
+        r"(?:没有|并没有|没|无|没有任何).{0,12}来自.{0,40}(?:的消息|消息)",
+        r"(?:对方|客户).{0,20}(?:没有|没).{0,12}(?:任何|新)?消息",
+        r"(?:此后|之后|后来).{0,12}(?:客户|对方).{0,10}(?:没有|没).{0,5}消息",
+        r"没有(?:任何)?(?:新)?消息需要(?:回复|应答|拟)",
+        r"没有(?:任何)?需要(?:回复|应答)的内容",
+        r"(?:再|也)?没有(?:发过|来过|发来)任何消息",
+    ])
+)
+_OUR_MESSAGE_EVIDENCE = re.compile(
+    "|".join([
+        r"(?:最近|最新|最后).{0,15}(?:的)?(?:两条|几条|一条|任何)?消息.{0,25}(?:都是|均为|是)(?:你|您|我方|自己|你这边|我这边).{0,10}发",
+        r"(?:最近|最新|最后).{0,40}由(?:你|您|我方|自己).{0,30}发出",
+        r"(?:最近|最新|最后).{0,30}(?:你是|我是|我方|你这边|我这边).{0,20}发出",
+        r"(?:你|您|我方|自己|你这边|我这边).{0,10}(?:发出的|发的)",
+    ])
+)
+
+
 def classify_response(raw: str) -> NativeAIResult:
     """Distinguish no inbound message from a malformed/failed AI reply."""
     if raw.strip() == _NO_INBOUND:
@@ -100,12 +123,10 @@ def classify_response(raw: str) -> NativeAIResult:
         clean = _extract_final_reply(raw)
         if clean:
             return NativeAIResult("reply", clean.replace(MANUAL_FLAG_MARKER, "").strip(), MANUAL_FLAG_MARKER in raw)
-    # Older WeCom replies can explain the no-inbound finding in prose instead of
+    # Older WeCom replies explain the no-inbound finding in prose instead of
     # following the requested marker. Require both absence of inbound and evidence
     # that recent messages were sent by us; don't treat arbitrary prose as a verdict.
-    no_inbound = re.search(r"(?:没有|并没有|未).{0,15}来自.{0,50}的消息|(?:对方|客户).{0,15}(?:没有|没).{0,10}发.{0,5}消息", raw)
-    our_messages = re.search(r"(?:最近|最新).{0,30}(?:消息|条).{0,20}(?:都是|均为|是)(?:你|您|我方)发出|(?:最近|最新).{0,30}(?:你|您|我方)发出", raw)
-    if no_inbound and our_messages:
+    if _NO_INBOUND_EVIDENCE.search(raw) and _OUR_MESSAGE_EVIDENCE.search(raw):
         return NativeAIResult("no_inbound")
     _extract_final_reply(raw)  # log malformed output for diagnostics
     return NativeAIResult("failed")

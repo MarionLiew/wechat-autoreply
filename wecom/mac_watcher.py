@@ -38,6 +38,7 @@ except ImportError:
 
 from config import settings
 from reply import engine, manual_alert, rules
+from reply.customer_address import normalize_address
 from storage import leads_log, mailer, message_log
 from storage.daily_stats import DailyTracker
 from wecom import ai_panel
@@ -2821,6 +2822,10 @@ class WeChatWatcher:
                 # 仅用 hash 标记当前这条消息已处理过，不整体屏蔽 sender
                 self._processed.add(msg["msg_hash"])
                 continue
+
+            # AI 和 RAG 直出共用最后一道称呼校验；规则/废话库原文不改。
+            if result["source"] in {"wecom_ai", "rag_direct", "rag_direct_sub", "rag_fewshot", "llm_rag", "llm"}:
+                result["content"] = normalize_address(result["content"], sender)
 
             logger.info(
                 "回复 [来源=%s]: %s",

@@ -21,6 +21,8 @@ import time
 
 import Quartz
 
+from reply.customer_address import address_instruction
+
 logger = logging.getLogger(__name__)
 
 _SPACE_KEYCODE = 49
@@ -70,6 +72,11 @@ _ASK_PROMPT_TEMPLATE = (
     f"必须由人工完成的事项，在 {_REPLY_END} 这一行之后再另起一行，只写"
     f"{MANUAL_FLAG_MARKER}（不要加任何解释）；不涉及这些事项就不要写这一行。"
 )
+
+
+def build_ask_prompt(contact_sender: str) -> str:
+    """Keep the existing context-chip request, with a contact-specific address rule."""
+    return _ASK_PROMPT_TEMPLATE + "\n\n【客户称呼（优先级最高）】" + address_instruction(contact_sender)
 
 
 def _extract_final_reply(raw: str) -> str | None:
@@ -499,7 +506,7 @@ def generate_reply(
             if not attach_contact_context(panel, contact_core):
                 return None, False
             time.sleep(0.3)
-            raw = ask(panel, _ASK_PROMPT_TEMPLATE, pid, timeout=timeout)
+            raw = ask(panel, build_ask_prompt(contact_sender), pid, timeout=timeout)
             if raw is None:
                 return None, False
             needs_manual = MANUAL_FLAG_MARKER in raw

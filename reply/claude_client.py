@@ -17,6 +17,7 @@ import logging
 import time
 
 from config import settings
+from reply.customer_address import address_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -142,74 +143,11 @@ def _build_system_prompt(
     """系统提示：基础 prompt + 可选的 RAG few-shot 示例（注入风格） + 当前客户名提示。"""
     base = settings.system_prompt
     extras = []
-    gender = _extract_gender(customer_name)
-
-    if customer_name:
-        clean_name = _extract_customer_name(customer_name)
-        if clean_name:
-            # 判断是中文名还是英文/拉丁名
-            has_chinese = any("一" <= ch <= "鿿" for ch in clean_name)
-            if has_chinese:
-                first = clean_name[0]
-                last = clean_name[-1] if len(clean_name) > 1 else clean_name
-                if gender == "男":
-                    extras.append(
-                        f"当前正在对话的客户全名是「{clean_name}」，性别：男。称呼时严格遵循以下规则：\n"
-                        f"- 「X先生」用客户的姓 → 「{first}先生」\n"
-                        f"- 「X哥/X总」用客户名末字 → 「{last}哥 / {last}总」\n"
-                        f"- 直接呼名也用末字「{last}」\n"
-                        "- 禁止使用「女士」「小姐」「姐」等女性称呼。\n"
-                        "- 禁止使用示例里的其他人名（那是过往客户）。"
-                    )
-                elif gender == "女":
-                    extras.append(
-                        f"当前正在对话的客户全名是「{clean_name}」，性别：女。称呼时严格遵循以下规则：\n"
-                        f"- 统一用「{first}女士」，不要用「小姐」「姐」\n"
-                        f"- 直接呼名用末字「{last}」\n"
-                        "- 禁止使用「先生」「哥」「姐」「小姐」等称呼。\n"
-                        "- 禁止使用示例里的其他人名（那是过往客户）。"
-                    )
-                else:
-                    extras.append(
-                        f"当前正在对话的客户全名是「{clean_name}」。称呼时严格遵循以下规则：\n"
-                        f"- 「X先生/X女士/X小姐」用客户的姓 → 「{first}先生 / {first}女士」\n"
-                        f"- 「X哥/X姐/X总/X爷」用客户名末字 → 「{last}哥 / {last}姐」\n"
-                        f"- 直接呼名也用末字「{last}」\n"
-                        "禁止使用示例里的其他人名（那是过往客户）。"
-                    )
-            else:
-                # 英文/拼音名：直接用完整名字，绝不要拆字加哥/姐（会得到 "a哥" 这种荒谬称呼）
-                if gender == "男":
-                    extras.append(
-                        f"当前正在对话的客户名是「{clean_name}」（英文/拼音名），性别：男。称呼时严格遵循：\n"
-                        f"- 直接喊「{clean_name}」即可，比如「{clean_name}，最近怎么样」「好嘞{clean_name}」\n"
-                        f"- 绝对禁止拆字加'哥/姐'：不能用「{clean_name[-1]}哥」「{clean_name[0]}先生」等\n"
-                        f"- 也可以不带名字，直接说「您」「咱们」\n"
-                        "- 禁止使用「女士」「小姐」「姐」等女性称呼。\n"
-                        "- 禁止使用示例里的其他人名（那是过往中文客户的称呼）。"
-                    )
-                elif gender == "女":
-                    extras.append(
-                        f"当前正在对话的客户名是「{clean_name}」（英文/拼音名），性别：女。称呼时严格遵循：\n"
-                        f"- 直接喊「{clean_name}」即可，比如「{clean_name}，最近怎么样」「好嘞{clean_name}」\n"
-                        f"- 绝对禁止拆字加'哥/姐/女士'：不能用「{clean_name[-1]}姐」「{clean_name[0]}女士」等\n"
-                        f"- 也可以不带名字，直接说「您」「咱们」\n"
-                        "- 禁止使用「先生」「哥」「姐」「小姐」等称呼。\n"
-                        "- 禁止使用示例里的其他人名（那是过往中文客户的称呼）。"
-                    )
-                else:
-                    extras.append(
-                        f"当前正在对话的客户名是「{clean_name}」（英文/拼音名）。称呼时严格遵循：\n"
-                        f"- 直接喊「{clean_name}」即可，比如「{clean_name}，最近怎么样」「好嘞{clean_name}」\n"
-                        f"- 绝对禁止拆字加'哥/姐'：不能用「{clean_name[-1]}哥」「{clean_name[0]}先生」等\n"
-                        f"- 也可以不带名字，直接说「您」「咱们」\n"
-                        "禁止使用示例里的其他人名（那是过往中文客户的称呼）。"
-                    )
 
     if few_shot:
         extras.append(
             "请参考以下「该客户经理过往真实对话」的风格回复——口吻、长度、emoji 使用习惯都要贴近示例。"
-            "注意：示例里的人名（'X哥/X姐'等）只是历史对话客户，不要直接复用，要按上面规则用当前客户的名字。"
+            "注意：示例里的亲昵称呼只是历史对话，必须遵守上述正式称呼规则，不要照搬。"
         )
         for i, ex in enumerate(few_shot, 1):
             q = (ex.get("q") or "").strip()
@@ -220,8 +158,9 @@ def _build_system_prompt(
             extras.append(f"\n示例 {i}:\n客户：{q}\n客户经理：{a}")
 
     if not extras:
-        return base
-    return base + "\n\n" + "\n\n".join(extras)
+        return base + "\n\n" + address_instruction(customer_name)
+    # Repeat the higher-priority constraint after raw historical examples as well.
+    return base + "\n\n" + "\n\n".join(extras) + "\n\n" + address_instruction(customer_name)
 
 
 def generate(

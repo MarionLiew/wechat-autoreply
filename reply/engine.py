@@ -138,6 +138,7 @@ def process_message(
         context=context,
         history=history,
         few_shot=rag_hits if rag_hits else None,
+        customer_name=sender_id,
     )
     if reply is not None:
         return {

@@ -2772,42 +2772,42 @@ class WeChatWatcher:
             except Exception as exc:
                 logger.debug("读取历史对话失败：%s", exc)
 
-            # 企微内置 AI 面板优先：rules 命中失败时先试面板（面板自己读聊天记录生成
-            # 回复），面板交互失败/未开启才回退到原 RAG/LLM 链路。
+            # 企微面板能辨别消息方向，必须先问它；本地规则也不能抢在方向判断之前。
             result = None
             if settings.wecom_ai_enabled:
-                quick_rule = rules.match(combined_text)
-                if quick_rule is not None:
-                    result = {"source": "rules", "content": quick_rule}
+                # 清理可能被误认作 AI 面板的经营线索弹窗。
+                try:
+                    self._close_xiansuo_popups()
+                except Exception as exc:
+                    logger.debug("AI 面板调用前关闭经营线索弹窗兜底异常：%s", exc)
+                try:
+                    native = ai_panel.generate_reply(
+                        self._get_app(),
+                        _get_wecom_pid(settings.wecom_bundle_id),
+                        sender,
+                        timeout=settings.wecom_ai_timeout_seconds,
+                    )
+                except Exception as exc:
+                    logger.warning("企微 AI 面板生成回复异常：%s", exc)
+                    native = ai_panel.NativeAIResult("failed")
+                if native.status == "no_inbound":
+                    logger.info("跳过 [%s]：企微 AI 确认最近没有客户消息", sender)
+                    self._last_text_by_sender[sender] = msg["text"]
+                    self._processed.add(msg["msg_hash"])
+                    continue
+                if native.status == "reply" and native.reply:
+                    result = {
+                        "source": "wecom_ai",
+                        "content": native.reply,
+                        "needs_manual": native.needs_manual,
+                    }
                 else:
-                    # 兜底：确保没有残留的经营线索详情弹窗——那类弹窗也是非主
-                    # 窗口，跟 AI 面板一样会被 ai_panel._panel_window() 的
-                    # "第一个非'企业微信'标题的窗口"逻辑误认成 AI 面板，
-                    # 导致后续找 chip/输入框全部找错窗口。跟经营线索处理前
-                    # 强制关 AI 面板是对称的兜底。
-                    try:
-                        self._close_xiansuo_popups()
-                    except Exception as exc:
-                        logger.debug("AI 面板调用前关闭经营线索弹窗兜底异常：%s", exc)
-                    self._send_quick_ack(msg["conv_row"], sender)
-                    try:
-                        ai_reply, ai_needs_manual = ai_panel.generate_reply(
-                            self._get_app(),
-                            _get_wecom_pid(settings.wecom_bundle_id),
-                            sender,
-                            timeout=settings.wecom_ai_timeout_seconds,
-                        )
-                    except Exception as exc:
-                        logger.warning("企微 AI 面板生成回复异常，回退原链路：%s", exc)
-                        ai_reply, ai_needs_manual = None, False
-                    if ai_reply:
-                        result = {
-                            "source": "wecom_ai",
-                            "content": ai_reply,
-                            "needs_manual": ai_needs_manual,
-                        }
+                    # 预览没有方向信息。AI 失败时不能拿我方群发交给二级 AI 猜。
+                    logger.warning("跳过 [%s]：企微 AI 未能确认消息方向，本轮不调用二级 AI", sender)
+                    self._last_text_by_sender[sender] = msg["text"]
+                    continue
 
-            # 引擎用合并文本做匹配；LLM 收到上下文 + 历史
+            # 仅在未启用企微 AI 时走旧规则/RAG/LLM 引擎。
             if result is None:
                 result = engine.process_message(
                     combined_text,

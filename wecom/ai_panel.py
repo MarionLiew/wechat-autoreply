@@ -17,7 +17,9 @@ from __future__ import annotations
 """
 
 import logging
+import re
 import time
+from typing import NamedTuple
 
 import Quartz
 
@@ -43,10 +45,13 @@ MANUAL_FLAG_MARKER = "[[NEEDHUMAN]]"
 # 之间的内容当正文，其余一律丢弃。
 _REPLY_START = "===回复正文开始==="
 _REPLY_END = "===回复正文结束==="
+_NO_INBOUND = "===无客户消息==="
 
 _ASK_PROMPT_TEMPLATE = (
-    "阅读这个客户的聊天记录，找到他最新一条消息，针对性地拟一个专业客服回复。\n"
-    f"必须用下面这个格式输出：\n{_REPLY_START}\n<这里只写发给客户看的回复正文>\n{_REPLY_END}\n\n"
+    "阅读这个客户的聊天记录，先辨别最后一条消息是谁发出的。若最近一条消息是我方发出、"
+    "客户在这之后没有新消息，只输出 ===无客户消息===（不写回复正文，也不要回答我方的群发、表情或安抚消息）。"
+    "只有确认最近一条消息来自客户时，才针对那条客户消息拟客服回复。\n"
+    f"确认有客户新消息时，必须用下面这个格式输出：\n{_REPLY_START}\n<这里只写发给客户看的回复正文>\n{_REPLY_END}\n\n"
     f"{_REPLY_START} 到 {_REPLY_END} 之间只能是纯客服话术本身——不能包含任何"
     "你的思考过程、判断依据、方案编号、说明、分析、备注、markdown 标记，"
     "也不能提到'标记''内部''系统识别''需人工处理'这类字眼来解释你在做什么，"
@@ -77,6 +82,33 @@ _ASK_PROMPT_TEMPLATE = (
 def build_ask_prompt(contact_sender: str) -> str:
     """Keep the existing context-chip request, with a contact-specific address rule."""
     return _ASK_PROMPT_TEMPLATE + "\n\n【客户称呼（优先级最高）】" + address_instruction(contact_sender)
+
+
+class NativeAIResult(NamedTuple):
+    status: str  # reply | no_inbound | failed
+    reply: str | None = None
+    needs_manual: bool = False
+
+
+def classify_response(raw: str) -> NativeAIResult:
+    """Distinguish no inbound message from a malformed/failed AI reply."""
+    if raw.strip() == _NO_INBOUND:
+        return NativeAIResult("no_inbound")
+    # A correctly delimited reply wins over incidental mentions of the same words
+    # inside the customer's question or the AI's answer.
+    if _REPLY_START in raw and _REPLY_END in raw:
+        clean = _extract_final_reply(raw)
+        if clean:
+            return NativeAIResult("reply", clean.replace(MANUAL_FLAG_MARKER, "").strip(), MANUAL_FLAG_MARKER in raw)
+    # Older WeCom replies can explain the no-inbound finding in prose instead of
+    # following the requested marker. Require both absence of inbound and evidence
+    # that recent messages were sent by us; don't treat arbitrary prose as a verdict.
+    no_inbound = re.search(r"(?:没有|并没有|未).{0,15}来自.{0,50}的消息|(?:对方|客户).{0,15}(?:没有|没).{0,10}发.{0,5}消息", raw)
+    our_messages = re.search(r"(?:最近|最新).{0,30}(?:消息|条).{0,20}(?:都是|均为|是)(?:你|您|我方)发出|(?:最近|最新).{0,30}(?:你|您|我方)发出", raw)
+    if no_inbound and our_messages:
+        return NativeAIResult("no_inbound")
+    _extract_final_reply(raw)  # log malformed output for diagnostics
+    return NativeAIResult("failed")
 
 
 def _extract_final_reply(raw: str) -> str | None:
@@ -479,45 +511,34 @@ def ask(panel, prompt: str, pid: int, timeout: float = 30.0, poll_interval: floa
 
 def generate_reply(
     app, pid: int, contact_sender: str, timeout: float = 30.0,
-) -> tuple[str | None, bool]:
-    """完整流程：开面板 → 附加 {contact_sender} 的完整聊天记录 → 提问 → 取回复 → 关面板。
+) -> NativeAIResult:
+    """Complete panel flow; return reply, no_inbound, or failed explicitly.
 
-    contact_sender: 如 '罗响(男)-4013'，内部会去掉括号/ID 后缀取核心名去匹配 chip。
-    全程 try/except，任一步失败都返回 (None, False)（调用方应回退到原 LLM 链路，
-    不抛异常）。
-
-    返回 (reply_text, needs_manual)：
-    - reply_text：已去掉 MANUAL_FLAG_MARKER 内部标记的、可直接发给客户的文本。
-    - needs_manual：AI 是否判断这条需要转人工处理（选座/改签等）——调用方应
-      据此触发邮件提醒，跟基于客户原话关键词的正则判断是两条独立信号，
-      任一为真都应提醒（正则漏判的场景靠这个兜底）。
+    A no_inbound verdict is authoritative: the caller must not invoke fallback AI.
     """
     contact_core = contact_sender.split("(")[0].strip() if contact_sender else ""
     try:
         panel = open_panel(app)
         if panel is None:
             logger.warning("打开企微 AI 面板失败（热键未生效或超时）")
-            return None, False
+            return NativeAIResult("failed")
         try:
             # 每次都先开新对话：保证历史不跨客户累积、且"和 XX 的聊天"
             # 这个 chip 每次都会重新可用（chip 只在新会话第一次提议）。
             start_new_conversation(panel)
             time.sleep(1.0)
             if not attach_contact_context(panel, contact_core):
-                return None, False
+                return NativeAIResult("failed")
             time.sleep(0.3)
             raw = ask(panel, build_ask_prompt(contact_sender), pid, timeout=timeout)
             if raw is None:
-                return None, False
-            needs_manual = MANUAL_FLAG_MARKER in raw
-            clean = _extract_final_reply(raw)
-            if clean is None:
-                # 定界符缺失＝生成失败，不发送未清洗的原始文本，回退原链路
-                return None, False
-            clean = clean.replace(MANUAL_FLAG_MARKER, "").strip()
-            if needs_manual:
+                return NativeAIResult("failed")
+            outcome = classify_response(raw)
+            if outcome.status == "no_inbound":
+                logger.info("企微 AI 判断该会话最近没有客户新消息，不触发二级 AI [%s]", contact_sender)
+            elif outcome.needs_manual:
                 logger.info("企微 AI 判断这条需转人工处理（已从回复中剔除内部标记）")
-            return clean, needs_manual
+            return outcome
         finally:
             close_panel(app)
     except Exception as exc:
@@ -526,4 +547,4 @@ def generate_reply(
             close_panel(app)
         except Exception:
             pass
-        return None, False
+        return NativeAIResult("failed")

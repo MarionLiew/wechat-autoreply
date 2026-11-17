@@ -85,12 +85,58 @@ def _maybe_dump(reason: str) -> None:
         logger.debug("自动 dump 失败：%s", exc)
 
 
+def _conversation_nodes(root, role: str, max_depth: int) -> list:
+    """限定原生会话树；不把网页、消息正文或嵌套表格内的文本当成会话。"""
+    if max_depth < 0:
+        return []
+    try:
+        current_role = str(getattr(root, "AXRole", "") or "")
+        if current_role in ("AXWebArea", "AXTextArea"):
+            return []
+        if current_role == role:
+            return [root]
+        if current_role == "AXTable":
+            return []
+    except Exception:
+        return []
+    out = []
+    for child in _safe_children(root):
+        out.extend(_conversation_nodes(child, role, max_depth - 1))
+    return out
+
+
 def find_conversation_table(window) -> Any | None:
-    """会话列表容器：窗口下第一个 AXTable。"""
-    table = deep_find_first(window, "AXTable", max_depth=10)
-    if table is None:
-        _maybe_dump("未找到 AXTable（会话列表）")
-    return table
+    """返回唯一含原生头像/文本会话单元格的表格；缺失或歧义时拒绝猜测。"""
+    candidates = []
+    for table in _conversation_nodes(window, "AXTable", max_depth=10):
+        for row in find_conversation_rows(table):
+            has_conversation_cell = False
+            for cell in _safe_children(row):
+                try:
+                    if str(getattr(cell, "AXRole", "") or "") != "AXCell":
+                        continue
+                    children = _safe_children(cell)
+                    has_avatar = any(
+                        str(getattr(child, "AXRole", "") or "") == "AXImage"
+                        for child in children
+                    )
+                    has_text = any(
+                        str(getattr(child, "AXRole", "") or "") == "AXStaticText"
+                        and str(getattr(child, "AXValue", "") or "").strip()
+                        for child in children
+                    )
+                    if has_avatar and has_text:
+                        has_conversation_cell = True
+                        break
+                except Exception:
+                    continue
+            if has_conversation_cell:
+                candidates.append(table)
+                break
+    if len(candidates) != 1:
+        _maybe_dump(f"会话列表 AXTable 候选数为 {len(candidates)}（缺失或歧义）")
+        return None
+    return candidates[0]
 
 
 def find_conversation_rows(table) -> list:

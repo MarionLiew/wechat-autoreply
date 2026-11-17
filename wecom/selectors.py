@@ -109,6 +109,13 @@ def find_conversation_table(window) -> Any | None:
     """返回唯一含原生头像/文本会话单元格的表格；缺失或歧义时拒绝猜测。"""
     candidates = []
     for table in _conversation_nodes(window, "AXTable", max_depth=10):
+        # Native message tables expose body text as AXTextArea. Only exact
+        # conversation badges are allowed; scan all rows before qualifying one.
+        if any(
+            str(getattr(area, "AXValue", "") or "").strip().rstrip("\u200b").strip() not in ("BOT", "外部")
+            for area in deep_find_all(table, "AXTextArea", max_depth=10)
+        ):
+            continue
         for row in find_conversation_rows(table):
             has_conversation_cell = False
             for cell in _safe_children(row):
@@ -116,10 +123,11 @@ def find_conversation_table(window) -> Any | None:
                     if str(getattr(cell, "AXRole", "") or "") != "AXCell":
                         continue
                     children = _safe_children(cell)
-                    has_avatar = any(
+                    # Native call rows have two direct icons, not one avatar.
+                    has_avatar = sum(
                         str(getattr(child, "AXRole", "") or "") == "AXImage"
                         for child in children
-                    )
+                    ) == 1
                     has_text = any(
                         str(getattr(child, "AXRole", "") or "") == "AXStaticText"
                         and str(getattr(child, "AXValue", "") or "").strip()
